@@ -776,6 +776,11 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
     assert schema.count("ReplacingMergeTree(row_version)") >= 7
     assert "ORDER BY (event_id, event_time, row_version)" in version_retention
     assert "ORDER BY (timestamp, event_id, row_version)" in version_retention
+    assert "DROP TABLE IF EXISTS imbalance.imbalance_observations__v2 SYNC" in version_retention
+    assert (
+        "DROP TABLE IF EXISTS imbalance.imbalance_observations__v1_backup SYNC"
+        in version_retention
+    )
     assert schema.count("PARTITION BY toYYYYMM(") >= 8
     assert "TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE" in schema
     assert "GRANT SELECT, INSERT ON imbalance.* TO imbalance" in schema

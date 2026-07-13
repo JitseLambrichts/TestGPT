@@ -126,6 +126,26 @@ async def optimize_table(table: str) -> None:
         await admin.close()
 
 
+async def rerun_migrations() -> None:
+    assert CLICKHOUSE_URL is not None
+    assert CLICKHOUSE_ADMIN_USER is not None
+    assert CLICKHOUSE_ADMIN_PASSWORD is not None
+    admin = await clickhouse_connect.get_async_client(
+        dsn=CLICKHOUSE_URL,
+        username=CLICKHOUSE_ADMIN_USER,
+        password=CLICKHOUSE_ADMIN_PASSWORD,
+        database="default",
+    )
+    try:
+        migrations = sorted((Path(__file__).parents[2] / "infra" / "clickhouse").glob("*.sql"))
+        for migration in migrations:
+            for statement in (item.strip() for item in migration.read_text().split(";")):
+                if statement:
+                    await admin.command(statement)
+    finally:
+        await admin.close()
+
+
 @pytest.mark.asyncio
 async def test_duplicate_insert_is_canonical_and_preserves_raw_json() -> None:
     client = await migrated_client()
@@ -221,6 +241,18 @@ async def test_state_seed_duration_starts_at_the_last_confirmed_sign_change() ->
         assert seed.last_observed_at == observations[-1].event_time
     finally:
         await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_source_version_migration_is_safe_to_rerun() -> None:
+    client = await migrated_client()
+    try:
+        await rerun_migrations()
+        created = await client.query("SHOW CREATE TABLE imbalance.imbalance_observations")
+
+        assert "ORDER BY (timestamp, event_id, row_version)" in str(created.first_row[0])
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

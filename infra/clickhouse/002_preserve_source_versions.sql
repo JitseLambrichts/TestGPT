@@ -4,6 +4,18 @@
 -- cannot be reconstructed, but every revision written after this migration remains
 -- available for point-in-time feature reconstruction.
 
+DROP TABLE IF EXISTS imbalance.raw_events__v2 SYNC;
+DROP TABLE IF EXISTS imbalance.imbalance_observations__v2 SYNC;
+DROP TABLE IF EXISTS imbalance.load_observations__v2 SYNC;
+DROP TABLE IF EXISTS imbalance.wind_observations__v2 SYNC;
+DROP TABLE IF EXISTS imbalance.solar_observations__v2 SYNC;
+
+DROP TABLE IF EXISTS imbalance.raw_events__v1_backup SYNC;
+DROP TABLE IF EXISTS imbalance.imbalance_observations__v1_backup SYNC;
+DROP TABLE IF EXISTS imbalance.load_observations__v1_backup SYNC;
+DROP TABLE IF EXISTS imbalance.wind_observations__v1_backup SYNC;
+DROP TABLE IF EXISTS imbalance.solar_observations__v1_backup SYNC;
+
 CREATE TABLE imbalance.raw_events__v2 AS imbalance.raw_events
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(event_time)
