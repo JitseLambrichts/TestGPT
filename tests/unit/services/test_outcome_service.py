@@ -326,6 +326,44 @@ async def test_outcome_events_are_deterministic_for_a_replayed_stored_revision()
     assert first.ingested_at == NOW
 
 
+@pytest.mark.asyncio
+async def test_reconciliation_matches_direct_outcome_for_the_same_source_revision() -> None:
+    trace: list[tuple[str, object]] = []
+    source_ingested_at = NOW.replace(microsecond=123_456)
+    canonical_source_ingested_at = NOW.replace(microsecond=123_000)
+    direct = stored_event().model_copy(
+        update={
+            "ingested_at": source_ingested_at,
+            "observed_at": source_ingested_at,
+            "payload": {
+                "source_event_id": "source-event-001",
+                "timestamp": NOW.isoformat().replace("+00:00", "Z"),
+                "source_ingested_at": source_ingested_at.isoformat().replace("+00:00", "Z"),
+            },
+        }
+    )
+    repository = FakeOutcomeRepository(
+        [prediction("prediction-positive", "positive")],
+        versions=[
+            VersionedImbalanceObservation(
+                realized_observation(),
+                canonical_source_ingested_at,
+                row_version=1,
+                event_id="source-event-001",
+            )
+        ],
+    )
+    bus = RecordingBus(trace)
+    service = OutcomeService(repository, bus, clock=lambda: NOW + timedelta(minutes=1))
+
+    await service.handle(RecordingMessage(direct, trace))
+    await service.handle(RecordingMessage(stored_prediction_event(), trace))
+
+    direct_outcome, reconciled_outcome = [event for _, event in bus.published]
+    assert direct_outcome == reconciled_outcome
+    assert direct_outcome.ingested_at == canonical_source_ingested_at
+
+
 def test_outcome_test_doubles_match_transport_protocols() -> None:
     trace: list[tuple[str, object]] = []
 

@@ -6,7 +6,7 @@ from typing import Final, Protocol, cast
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from imbalance_pipeline.config import get_settings
-from imbalance_pipeline.domain.events import EventEnvelope, Subject, event_id
+from imbalance_pipeline.domain.events import EventEnvelope, Subject, event_id, utc_milliseconds
 from imbalance_pipeline.domain.imbalance import (
     ConfirmedState,
     ImbalanceObservation,
@@ -161,7 +161,7 @@ class OutcomeService:
         )
         if realized is None:
             raise RuntimeError("stored imbalance trigger has no realized observation")
-        return await self._prediction_outcomes(event, trigger, realized)
+        return await self._prediction_outcomes(trigger, realized)
 
     async def _reconcile_stored_prediction(
         self,
@@ -182,16 +182,14 @@ class OutcomeService:
             versions,
             key=lambda version: (version.row_version, version.available_at, version.event_id),
         )
-        realization_event, realization_trigger = _reconciled_realization(event, latest)
+        realization_trigger = _reconciled_realization(latest)
         return await self._prediction_outcomes(
-            realization_event,
             realization_trigger,
             latest.observation,
         )
 
     async def _prediction_outcomes(
         self,
-        event: EventEnvelope,
         trigger: _StoredImbalancePayload,
         realized: ImbalanceObservation,
     ) -> list[EventEnvelope]:
@@ -201,7 +199,6 @@ class OutcomeService:
         ]
         return [
             _outcome_event(
-                event,
                 trigger,
                 prediction,
                 realized,
@@ -276,38 +273,18 @@ def _invalid_reason(event: EventEnvelope) -> DeadLetterReason:
 
 
 def _reconciled_realization(
-    trigger_event: EventEnvelope,
     realization: VersionedImbalanceObservation,
-) -> tuple[EventEnvelope, _StoredImbalancePayload]:
+) -> _StoredImbalancePayload:
     observation = realization.observation
-    source_ingested_at = realization.available_at.astimezone(UTC)
-    payload = _StoredImbalancePayload(
+    source_ingested_at = utc_milliseconds(realization.available_at)
+    return _StoredImbalancePayload(
         source_event_id=realization.event_id,
         timestamp=observation.timestamp,
         source_ingested_at=source_ingested_at,
     )
-    event = EventEnvelope(
-        event_id=event_id(
-            "outcome-joiner",
-            "reconciled-imbalance",
-            f"{realization.event_id}:{source_ingested_at.isoformat()}",
-        ),
-        event_type="elia.imbalance.stored",
-        source="outcome-joiner",
-        dataset="system-imbalance",
-        event_time=observation.timestamp,
-        observed_at=None,
-        ingested_at=source_ingested_at,
-        correlation_id=trigger_event.correlation_id,
-        causation_id=trigger_event.event_id,
-        quality_status=observation.quality_status,
-        payload=payload.model_dump(mode="json"),
-    )
-    return event, payload
 
 
 def _outcome_event(
-    trigger_event: EventEnvelope,
     trigger: _StoredImbalancePayload,
     prediction: Prediction,
     realized: ImbalanceObservation,
@@ -321,7 +298,7 @@ def _outcome_event(
         deadband_mw=deadband_mw,
     )
     flip_actual = flip_label(current_state, realized_state)
-    evaluated_at = trigger.source_ingested_at or trigger_event.ingested_at
+    evaluated_at = utc_milliseconds(trigger.source_ingested_at or trigger.timestamp)
     return EventEnvelope(
         event_id=event_id(
             "outcome-joiner",
@@ -338,9 +315,9 @@ def _outcome_event(
         source="outcome-joiner",
         dataset="system-imbalance",
         event_time=trigger.timestamp,
-        observed_at=trigger_event.observed_at,
+        observed_at=None,
         ingested_at=evaluated_at,
-        correlation_id=trigger_event.correlation_id,
+        correlation_id=trigger.source_event_id,
         causation_id=prediction.event_id,
         quality_status=realized.quality_status,
         payload={

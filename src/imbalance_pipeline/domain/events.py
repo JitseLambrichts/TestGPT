@@ -34,6 +34,14 @@ def event_id(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+def utc_milliseconds(value: datetime) -> datetime:
+    """Normalize a timestamp to the precision persisted by ClickHouse DateTime64(3)."""
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("timestamps must be UTC-aware")
+    normalized = value.astimezone(UTC)
+    return normalized.replace(microsecond=(normalized.microsecond // 1_000) * 1_000)
+
+
 class EventEnvelope(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

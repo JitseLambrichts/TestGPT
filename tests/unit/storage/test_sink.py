@@ -915,6 +915,27 @@ async def test_sink_publishes_a_stored_prediction_reconciliation_trigger() -> No
 
 
 @pytest.mark.asyncio
+async def test_stored_prediction_trigger_tolerates_extra_prediction_metadata() -> None:
+    trace: list[tuple[str, object]] = []
+    source = prediction_source_event().model_copy(
+        update={
+            "payload": {
+                **prediction_source_event().payload,
+                "degraded_reason": "model_bundle_unavailable",
+            }
+        }
+    )
+    bus = RecordingBus(trace)
+    message = RecordingMessage(source, trace)
+
+    await Sink(RecordingRepository(trace), bus).handle(message)
+
+    assert message.acked is True
+    assert message.nak_delay is None
+    assert bus.published[0][0] == "grid.stored.prediction.imbalance.v1"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("delivery_count", "expected_delay"),
     [(1, 1.0), (2, 5.0), (3, 30.0), (4, 120.0)],

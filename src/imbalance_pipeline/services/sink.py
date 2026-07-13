@@ -2,16 +2,15 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Final, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from imbalance_pipeline.config import get_settings
-from imbalance_pipeline.domain.events import EventEnvelope, Subject, event_id
+from imbalance_pipeline.domain.events import EventEnvelope, Subject, event_id, utc_milliseconds
 from imbalance_pipeline.messaging.base import EventBus, Message
 from imbalance_pipeline.storage.clickhouse import (
     ClickHouseRepository,
     DeadLetterReason,
     PermanentEventError,
-    Prediction,
     TransientStorageError,
 )
 
@@ -42,6 +41,20 @@ class DeadLetterPayload(BaseModel):
     original_event: EventEnvelope
     reason: DeadLetterReason
     delivery_count: int
+
+
+class _StoredPredictionTrigger(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    target_time: datetime
+    generated_at: datetime
+
+    @field_validator("target_time", "generated_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("stored prediction timestamps must be UTC-aware")
+        return value.astimezone(UTC)
 
 
 class MessageSettlementError(RuntimeError):
@@ -142,11 +155,12 @@ class Sink:
 
 
 def _stored_event(source: EventEnvelope) -> EventEnvelope:
+    source_ingested_at = utc_milliseconds(source.ingested_at)
     return EventEnvelope(
         event_id=event_id(
             "clickhouse",
             "stored-elia-imbalance",
-            f"{source.event_id}:{source.ingested_at.isoformat()}",
+            f"{source.event_id}:{source_ingested_at.isoformat()}",
             source.schema_version,
         ),
         event_type="elia.imbalance.stored",
@@ -155,14 +169,14 @@ def _stored_event(source: EventEnvelope) -> EventEnvelope:
         dataset=source.dataset,
         event_time=source.event_time,
         observed_at=source.observed_at,
-        ingested_at=source.ingested_at,
+        ingested_at=source_ingested_at,
         correlation_id=source.correlation_id,
         causation_id=source.event_id,
         quality_status=source.quality_status,
         payload={
             "source_event_id": source.event_id,
             "timestamp": source.event_time.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-            "source_ingested_at": source.ingested_at.astimezone(UTC)
+            "source_ingested_at": source_ingested_at
             .isoformat()
             .replace("+00:00", "Z"),
         },
@@ -170,12 +184,13 @@ def _stored_event(source: EventEnvelope) -> EventEnvelope:
 
 
 def _stored_prediction_event(source: EventEnvelope) -> EventEnvelope:
-    prediction = Prediction.model_validate({"event_id": source.event_id, **source.payload})
+    prediction = _StoredPredictionTrigger.model_validate(source.payload)
+    source_ingested_at = utc_milliseconds(source.ingested_at)
     return EventEnvelope(
         event_id=event_id(
             "clickhouse",
             "stored-imbalance-prediction",
-            f"{source.event_id}:{source.ingested_at.isoformat()}",
+            f"{source.event_id}:{source_ingested_at.isoformat()}",
             source.schema_version,
         ),
         event_type="imbalance.prediction.stored",
@@ -184,7 +199,7 @@ def _stored_prediction_event(source: EventEnvelope) -> EventEnvelope:
         dataset=source.dataset,
         event_time=prediction.target_time,
         observed_at=source.observed_at,
-        ingested_at=source.ingested_at,
+        ingested_at=source_ingested_at,
         correlation_id=source.correlation_id,
         causation_id=source.event_id,
         quality_status=source.quality_status,
