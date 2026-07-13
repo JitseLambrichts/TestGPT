@@ -238,6 +238,25 @@ async def test_build_many_uses_one_ordered_version_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_session_shares_one_version_stream_across_training_batches() -> None:
+    cutoffs = [CUTOFF - timedelta(minutes=offset) for offset in range(4, 0, -1)]
+    knowledge = [cutoff + timedelta(seconds=10) for cutoff in cutoffs]
+    source = MemoryFeatureSource(minute_rows(CUTOFF, 36 * 60, value=15.0))
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    replay = await engine.open_replay(
+        end=cutoffs[-1],
+        knowledge_cutoff=knowledge[-1],
+    )
+    first_batch = replay.build_many(cutoffs[:2], knowledge_cutoffs=knowledge[:2])
+    second_batch = replay.build_many(cutoffs[2:], knowledge_cutoffs=knowledge[2:])
+
+    assert [snapshot.cutoff for snapshot in first_batch + second_batch] == cutoffs
+    assert len(source.version_calls) == 1
+    assert source.seed_calls == []
+
+
+@pytest.mark.asyncio
 async def test_build_many_replays_late_corrections_before_the_local_window() -> None:
     timestamp = CUTOFF - timedelta(minutes=2_000)
     original = VersionedObservation(

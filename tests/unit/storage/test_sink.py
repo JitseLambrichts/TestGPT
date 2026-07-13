@@ -26,6 +26,7 @@ from imbalance_pipeline.storage.clickhouse import (
     Prediction,
     TransientStorageError,
 )
+from imbalance_pipeline.storage.migrations import SOURCE_VERSION_MIGRATIONS
 
 
 def imbalance_event() -> EventEnvelope:
@@ -751,13 +752,14 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
         assert f"CREATE TABLE IF NOT EXISTS imbalance.{table}" in schema
     assert schema.count("DateTime64(3, 'UTC')") >= 20
     assert schema.count("ReplacingMergeTree(row_version)") >= 7
-    assert "ORDER BY (event_id, event_time, row_version)" in version_retention
-    assert "ORDER BY (timestamp, event_id, row_version)" in version_retention
-    assert "DROP TABLE IF EXISTS imbalance.imbalance_observations__v2 SYNC" in version_retention
-    assert (
-        "DROP TABLE IF EXISTS imbalance.imbalance_observations__v1_backup SYNC"
-        in version_retention
-    )
+    assert "migrate_source_version_retention" in version_retention
+    assert {definition.table for definition in SOURCE_VERSION_MIGRATIONS} == {
+        "raw_events",
+        "imbalance_observations",
+        "load_observations",
+        "wind_observations",
+        "solar_observations",
+    }
     assert schema.count("PARTITION BY toYYYYMM(") >= 8
     assert "TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE" in schema
     assert "GRANT SELECT, INSERT ON imbalance.* TO imbalance" in schema

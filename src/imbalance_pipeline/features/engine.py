@@ -142,6 +142,95 @@ class _StateReplay:
         return _compose_state_transformers(left, right)
 
 
+class FeatureReplaySession:
+    """Reuses one point-in-time version stream across chronological training batches."""
+
+    def __init__(
+        self,
+        engine: "FeatureEngine",
+        versions: Sequence[VersionedImbalanceObservation],
+        *,
+        end: datetime,
+        knowledge_cutoff: datetime,
+    ) -> None:
+        self._engine = engine
+        self._end = end
+        self._knowledge_cutoff = knowledge_cutoff
+        timestamps = tuple(sorted({_utc(version.observation.timestamp) for version in versions}))
+        self._state_replay = _StateReplay(timestamps, engine._registry.deadband_mw)
+        self._versions = tuple(
+            sorted(
+                versions,
+                key=lambda item: (
+                    item.available_at,
+                    item.row_version,
+                    item.event_id,
+                    item.observation.timestamp,
+                ),
+            )
+        )
+        self._best_versions: dict[datetime, tuple[int, datetime, str]] = {}
+        self._observations: dict[datetime, ImbalanceObservation] = {}
+        self._version_index = 0
+        self._last_knowledge_cutoff: datetime | None = None
+
+    def build_many(
+        self,
+        event_cutoffs: Sequence[datetime],
+        *,
+        knowledge_cutoffs: Sequence[datetime],
+    ) -> list[FeatureSnapshot]:
+        if len(event_cutoffs) != len(knowledge_cutoffs):
+            raise ValueError("event_cutoffs and knowledge_cutoffs must have equal lengths")
+        cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
+        knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
+        if any(cutoff > self._end for cutoff in cutoffs):
+            raise ValueError("replay session does not include the requested event cutoff")
+        if any(cutoff > self._knowledge_cutoff for cutoff in knowledge):
+            raise ValueError("replay session does not include the requested knowledge cutoff")
+        if any(later < earlier for earlier, later in zip(knowledge, knowledge[1:], strict=False)):
+            raise ValueError("replay session batches must have non-decreasing knowledge cutoffs")
+        if self._last_knowledge_cutoff is not None and knowledge:
+            if knowledge[0] < self._last_knowledge_cutoff:
+                raise ValueError("replay session cannot move backwards in knowledge time")
+
+        snapshots: list[FeatureSnapshot] = []
+        for cutoff, known_at in zip(cutoffs, knowledge, strict=True):
+            self._advance_to(known_at)
+            history_times = _history_times(cutoff, self._engine._registry)
+            state_seed = self._state_replay.seed_before(history_times[0], self._observations)
+            history_observations = [
+                self._observations[timestamp]
+                for timestamp in history_times
+                if timestamp in self._observations
+            ]
+            snapshots.append(
+                self._engine._transform(
+                    cutoff,
+                    known_at,
+                    history_observations,
+                    state_seed,
+                )
+            )
+        if knowledge:
+            self._last_knowledge_cutoff = knowledge[-1]
+        return snapshots
+
+    def _advance_to(self, known_at: datetime) -> None:
+        while (
+            self._version_index < len(self._versions)
+            and self._versions[self._version_index].available_at <= known_at
+        ):
+            version = self._versions[self._version_index]
+            timestamp = _utc(version.observation.timestamp)
+            rank = (version.row_version, version.available_at, version.event_id)
+            if rank >= self._best_versions.get(timestamp, (-1, REPLAY_START, "")):
+                self._best_versions[timestamp] = rank
+                self._observations[timestamp] = version.observation
+                self._state_replay.update(timestamp, version.observation.system_imbalance_mw)
+            self._version_index += 1
+
+
 class FeatureEngine:
     def __init__(
         self,
@@ -189,67 +278,44 @@ class FeatureEngine:
             return []
         cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
         knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
-        versions = await self._source.fetch_imbalance_versions(
-            REPLAY_START,
-            max(cutoffs),
+        replay = await self.open_replay(
+            end=max(cutoffs),
             knowledge_cutoff=max(knowledge),
-        )
-        return self._replay_versions(cutoffs, knowledge, versions)
-
-    def _replay_versions(
-        self,
-        cutoffs: Sequence[datetime],
-        knowledge: Sequence[datetime],
-        versions: Sequence[VersionedImbalanceObservation],
-    ) -> list[FeatureSnapshot]:
-        timestamps = tuple(sorted({_utc(version.observation.timestamp) for version in versions}))
-        replay = _StateReplay(timestamps, self._registry.deadband_mw)
-        ordered_versions = sorted(
-            versions,
-            key=lambda item: (
-                item.available_at,
-                item.row_version,
-                item.event_id,
-                item.observation.timestamp,
-            ),
         )
         requests = sorted(
             enumerate(zip(cutoffs, knowledge, strict=True)),
             key=lambda item: (item[1][1], item[1][0], item[0]),
         )
-        best_versions: dict[datetime, tuple[int, datetime, str]] = {}
-        observations: dict[datetime, ImbalanceObservation] = {}
+        ordered_snapshots = replay.build_many(
+            [cutoff for _, (cutoff, _) in requests],
+            knowledge_cutoffs=[known_at for _, (_, known_at) in requests],
+        )
         snapshots: list[FeatureSnapshot | None] = [None] * len(cutoffs)
-        version_index = 0
-        for original_index, (cutoff, known_at) in requests:
-            while (
-                version_index < len(ordered_versions)
-                and ordered_versions[version_index].available_at <= known_at
-            ):
-                version = ordered_versions[version_index]
-                timestamp = _utc(version.observation.timestamp)
-                rank = (version.row_version, version.available_at, version.event_id)
-                if rank >= best_versions.get(timestamp, (-1, REPLAY_START, "")):
-                    best_versions[timestamp] = rank
-                    observations[timestamp] = version.observation
-                    replay.update(timestamp, version.observation.system_imbalance_mw)
-                version_index += 1
-            history_times = _history_times(cutoff, self._registry)
-            state_seed = replay.seed_before(history_times[0], observations)
-            history_observations = [
-                observations[timestamp]
-                for timestamp in history_times
-                if timestamp in observations
-            ]
-            snapshots[original_index] = self._transform(
-                cutoff,
-                known_at,
-                history_observations,
-                state_seed,
-            )
+        for (original_index, _), snapshot in zip(requests, ordered_snapshots, strict=True):
+            snapshots[original_index] = snapshot
         if any(snapshot is None for snapshot in snapshots):
             raise RuntimeError("feature replay did not return every requested snapshot")
         return [snapshot for snapshot in snapshots if snapshot is not None]
+
+    async def open_replay(
+        self,
+        *,
+        end: datetime,
+        knowledge_cutoff: datetime,
+    ) -> FeatureReplaySession:
+        replay_end = _utc(end)
+        replay_knowledge_cutoff = _utc(knowledge_cutoff)
+        versions = await self._source.fetch_imbalance_versions(
+            REPLAY_START,
+            replay_end,
+            knowledge_cutoff=replay_knowledge_cutoff,
+        )
+        return FeatureReplaySession(
+            self,
+            versions,
+            end=replay_end,
+            knowledge_cutoff=replay_knowledge_cutoff,
+        )
 
     def _transform(
         self,
