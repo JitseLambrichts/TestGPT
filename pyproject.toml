@@ -50,6 +50,9 @@ imbalance-export = "imbalance_pipeline.training.export_data:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/imbalance_pipeline"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"infra/clickhouse" = "imbalance_pipeline/storage/sql_migrations"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"

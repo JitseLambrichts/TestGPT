@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from tomllib import loads
 from types import SimpleNamespace
 
 import pytest
@@ -203,3 +204,12 @@ async def test_runner_renders_the_database_identifier_after_identifier_validatio
 
     assert "CREATE TABLE IF NOT EXISTS demo.schema_migrations (version UInt32)" in client.commands
     assert all("imbalance.schema_migrations" not in command for command in client.commands)
+
+
+def test_wheel_configuration_includes_sql_migrations_as_package_resources() -> None:
+    pyproject = Path(__file__).parents[3] / "pyproject.toml"
+    configuration = loads(pyproject.read_text())
+
+    assert configuration["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"] == {
+        "infra/clickhouse": "imbalance_pipeline/storage/sql_migrations"
+    }

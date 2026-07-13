@@ -188,6 +188,9 @@ def _checksum_text(value: object) -> str:
 
 
 def _default_migration_directory() -> Path:
+    packaged = Path(__file__).parent / "sql_migrations"
+    if packaged.is_dir():
+        return packaged
     return Path(__file__).parents[3] / "infra" / "clickhouse"
 
 
