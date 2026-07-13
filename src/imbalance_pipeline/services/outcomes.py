@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Final, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -10,6 +10,7 @@ from imbalance_pipeline.domain.events import EventEnvelope, Subject, event_id
 from imbalance_pipeline.domain.imbalance import (
     ConfirmedState,
     ImbalanceObservation,
+    VersionedImbalanceObservation,
     advance_state,
     flip_label,
 )
@@ -23,13 +24,11 @@ from imbalance_pipeline.storage.clickhouse import (
 
 OUTCOME_DLQ_SUBJECT: Final = "grid.dlq.outcomes.v1"
 OUTCOME_SUBSCRIPTION: Final = (Subject.STORED_ELIA_IMBALANCE.value, "outcome-builder-v1")
-MAX_PENDING_PREDICTION_DELIVERIES: Final = 5
-PENDING_PREDICTION_DELAY_SECONDS: Final = 5.0
-PREDICTION_SETTLEMENT_GRACE: Final = timedelta(seconds=5)
-
-
-class PendingPredictionError(RuntimeError):
-    """Raised while the prediction sink has not caught up with a realized target."""
+OUTCOME_PREDICTION_SUBSCRIPTION: Final = (
+    Subject.STORED_IMBALANCE_PREDICTION.value,
+    "outcome-prediction-reconcile-v1",
+)
+OUTCOME_SUBSCRIPTIONS: Final = (OUTCOME_SUBSCRIPTION, OUTCOME_PREDICTION_SUBSCRIPTION)
 
 
 class OutcomeRepository(Protocol):
@@ -42,6 +41,14 @@ class OutcomeRepository(Protocol):
     ) -> list[ImbalanceObservation]: ...
 
     async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]: ...
+
+    async def fetch_imbalance_versions(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        knowledge_cutoff: datetime,
+    ) -> list[VersionedImbalanceObservation]: ...
 
 
 class _StoredImbalancePayload(BaseModel):
@@ -58,6 +65,21 @@ class _StoredImbalancePayload(BaseModel):
             return None
         if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
             raise ValueError("stored imbalance timestamp must be UTC-aware")
+        return value.astimezone(UTC)
+
+
+class _StoredPredictionPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    prediction_event_id: str
+    target_time: datetime
+    generated_at: datetime
+
+    @field_validator("target_time", "generated_at")
+    @classmethod
+    def require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("stored prediction timestamp must be UTC-aware")
         return value.astimezone(UTC)
 
 
@@ -79,32 +101,43 @@ class OutcomeService:
 
     async def handle(self, message: Message) -> None:
         try:
-            trigger = _stored_payload(message.event)
+            event_type = message.event.event_type
+            if event_type == "elia.imbalance.stored":
+                trigger = _stored_payload(message.event)
+                prediction_trigger = None
+            elif event_type == "imbalance.prediction.stored":
+                trigger = None
+                prediction_trigger = _stored_prediction_payload(message.event)
+            else:
+                raise ValueError("outcome service accepts only stored imbalance events")
         except (TypeError, ValidationError, ValueError):
             await self._reject(message, _invalid_reason(message.event))
             return
         try:
-            if self._prediction_settlement_pending(message.event):
-                raise PendingPredictionError("prediction settlement grace period has not elapsed")
-            outcomes = await self._build_outcomes(message.event, trigger)
-        except PendingPredictionError:
-            if message.delivery_count >= MAX_PENDING_PREDICTION_DELIVERIES:
-                await self._reject(message, DeadLetterReason.DELIVERY_EXHAUSTED)
+            if trigger is not None:
+                outcomes = await self._build_outcomes(message.event, trigger)
             else:
-                await message.nak(PENDING_PREDICTION_DELAY_SECONDS)
-            return
+                assert prediction_trigger is not None
+                outcomes = await self._reconcile_stored_prediction(
+                    message.event,
+                    prediction_trigger,
+                )
         except Exception:
-            await message.nak(PENDING_PREDICTION_DELAY_SECONDS)
+            await message.nak(5.0)
             return
         try:
             for outcome in outcomes:
                 await self._bus.publish(Subject.OUTCOMES_IMBALANCE.value, outcome)
             await message.ack()
         except Exception:
-            await message.nak(PENDING_PREDICTION_DELAY_SECONDS)
+            await message.nak(5.0)
 
     async def run(self) -> None:
-        subject, durable = OUTCOME_SUBSCRIPTION
+        async with asyncio.TaskGroup() as tasks:
+            for subject, durable in OUTCOME_SUBSCRIPTIONS:
+                tasks.create_task(self._consume(subject, durable), name=durable)
+
+    async def _consume(self, subject: str, durable: str) -> None:
         async for message in self._bus.messages(subject, durable):
             await self.handle(message)
 
@@ -128,12 +161,44 @@ class OutcomeService:
         )
         if realized is None:
             raise RuntimeError("stored imbalance trigger has no realized observation")
+        return await self._prediction_outcomes(event, trigger, realized)
+
+    async def _reconcile_stored_prediction(
+        self,
+        event: EventEnvelope,
+        trigger: _StoredPredictionPayload,
+    ) -> list[EventEnvelope]:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
+            raise ValueError("outcome reconciliation clock must be UTC-aware")
+        versions = await self._repository.fetch_imbalance_versions(
+            trigger.target_time,
+            trigger.target_time,
+            knowledge_cutoff=now.astimezone(UTC),
+        )
+        if not versions:
+            return []
+        latest = max(
+            versions,
+            key=lambda version: (version.row_version, version.available_at, version.event_id),
+        )
+        realization_event, realization_trigger = _reconciled_realization(event, latest)
+        return await self._prediction_outcomes(
+            realization_event,
+            realization_trigger,
+            latest.observation,
+        )
+
+    async def _prediction_outcomes(
+        self,
+        event: EventEnvelope,
+        trigger: _StoredImbalancePayload,
+        realized: ImbalanceObservation,
+    ) -> list[EventEnvelope]:
         predictions = await self._repository.fetch_predictions_for_target(trigger.timestamp)
         eligible_predictions = [
             prediction for prediction in predictions if prediction.generated_at <= trigger.timestamp
         ]
-        if not eligible_predictions:
-            raise PendingPredictionError("no eligible prediction is stored for realized target")
         return [
             _outcome_event(
                 event,
@@ -144,12 +209,6 @@ class OutcomeService:
             )
             for prediction in eligible_predictions
         ]
-
-    def _prediction_settlement_pending(self, event: EventEnvelope) -> bool:
-        now = self._clock()
-        if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
-            raise ValueError("outcome settlement clock must be UTC-aware")
-        return now.astimezone(UTC) < event.ingested_at + PREDICTION_SETTLEMENT_GRACE
 
     async def _reject(self, message: Message, reason: DeadLetterReason) -> None:
         event = message.event
@@ -197,12 +256,54 @@ def _stored_payload(event: EventEnvelope) -> _StoredImbalancePayload:
     return payload
 
 
+def _stored_prediction_payload(event: EventEnvelope) -> _StoredPredictionPayload:
+    if event.event_type != "imbalance.prediction.stored":
+        raise ValueError("outcome service accepts only stored prediction triggers")
+    if event.schema_version != "1":
+        raise ValueError("unsupported stored prediction schema version")
+    payload = _StoredPredictionPayload.model_validate(event.payload)
+    if payload.target_time != event.event_time:
+        raise ValueError("stored prediction target does not match event time")
+    return payload
+
+
 def _invalid_reason(event: EventEnvelope) -> DeadLetterReason:
-    if event.event_type != "elia.imbalance.stored":
+    if event.event_type not in {"elia.imbalance.stored", "imbalance.prediction.stored"}:
         return DeadLetterReason.UNSUPPORTED_EVENT_TYPE
     if event.schema_version != "1":
         return DeadLetterReason.UNSUPPORTED_SCHEMA_VERSION
     return DeadLetterReason.INVALID_PAYLOAD
+
+
+def _reconciled_realization(
+    trigger_event: EventEnvelope,
+    realization: VersionedImbalanceObservation,
+) -> tuple[EventEnvelope, _StoredImbalancePayload]:
+    observation = realization.observation
+    source_ingested_at = realization.available_at.astimezone(UTC)
+    payload = _StoredImbalancePayload(
+        source_event_id=realization.event_id,
+        timestamp=observation.timestamp,
+        source_ingested_at=source_ingested_at,
+    )
+    event = EventEnvelope(
+        event_id=event_id(
+            "outcome-joiner",
+            "reconciled-imbalance",
+            f"{realization.event_id}:{source_ingested_at.isoformat()}",
+        ),
+        event_type="elia.imbalance.stored",
+        source="outcome-joiner",
+        dataset="system-imbalance",
+        event_time=observation.timestamp,
+        observed_at=None,
+        ingested_at=source_ingested_at,
+        correlation_id=trigger_event.correlation_id,
+        causation_id=trigger_event.event_id,
+        quality_status=observation.quality_status,
+        payload=payload.model_dump(mode="json"),
+    )
+    return event, payload
 
 
 def _outcome_event(
@@ -225,7 +326,13 @@ def _outcome_event(
         event_id=event_id(
             "outcome-joiner",
             "prediction-outcome",
-            f"{prediction.event_id}:{trigger_event.event_id}",
+            ":".join(
+                (
+                    prediction.event_id,
+                    trigger.source_event_id,
+                    evaluated_at.astimezone(UTC).isoformat(),
+                )
+            ),
         ),
         event_type="imbalance.prediction.evaluated",
         source="outcome-joiner",

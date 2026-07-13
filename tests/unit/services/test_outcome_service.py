@@ -4,13 +4,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from imbalance_pipeline.domain.events import EventEnvelope, Subject
-from imbalance_pipeline.domain.imbalance import ImbalanceObservation
+from imbalance_pipeline.domain.imbalance import ImbalanceObservation, VersionedImbalanceObservation
 from imbalance_pipeline.messaging.base import EventBus, Message
 from imbalance_pipeline.services.outcomes import (
-    MAX_PENDING_PREDICTION_DELIVERIES,
-    OUTCOME_DLQ_SUBJECT,
+    OUTCOME_PREDICTION_SUBSCRIPTION,
     OUTCOME_SUBSCRIPTION,
-    PREDICTION_SETTLEMENT_GRACE,
     OutcomeService,
 )
 from imbalance_pipeline.storage.clickhouse import Prediction
@@ -60,13 +58,23 @@ class FakeOutcomeRepository:
         predictions: list[Prediction],
         *,
         observations: list[ImbalanceObservation] | None = None,
+        versions: list[VersionedImbalanceObservation] | None = None,
         failure: Exception | None = None,
     ) -> None:
         self.predictions = predictions
         self.observations = observations or [realized_observation()]
+        self.versions = versions or [
+            VersionedImbalanceObservation(
+                realized_observation(),
+                NOW,
+                row_version=1,
+                event_id="source-event-001",
+            )
+        ]
         self.failure = failure
         self.window_calls: list[tuple[datetime, int, datetime]] = []
         self.prediction_calls: list[datetime] = []
+        self.version_calls: list[tuple[datetime, datetime, datetime]] = []
 
     async def fetch_imbalance_window(
         self,
@@ -83,6 +91,23 @@ class FakeOutcomeRepository:
     async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]:
         self.prediction_calls.append(target_time)
         return self.predictions
+
+    async def fetch_imbalance_versions(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        knowledge_cutoff: datetime,
+    ) -> list[VersionedImbalanceObservation]:
+        self.version_calls.append((start, end, knowledge_cutoff))
+        if self.failure is not None:
+            raise self.failure
+        return [
+            version
+            for version in self.versions
+            if start <= version.observation.timestamp <= end
+            and version.available_at <= knowledge_cutoff
+        ]
 
 
 def stored_event() -> EventEnvelope:
@@ -101,6 +126,26 @@ def stored_event() -> EventEnvelope:
             "source_event_id": "source-event-001",
             "timestamp": NOW.isoformat().replace("+00:00", "Z"),
             "source_ingested_at": NOW.isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+
+def stored_prediction_event(event_id: str = "stored-prediction-001") -> EventEnvelope:
+    return EventEnvelope(
+        event_id=event_id,
+        event_type="imbalance.prediction.stored",
+        source="clickhouse",
+        dataset="system-imbalance",
+        event_time=NOW,
+        observed_at=NOW,
+        ingested_at=NOW,
+        correlation_id="prediction-event-001",
+        causation_id="prediction-event-001",
+        quality_status="model",
+        payload={
+            "prediction_event_id": "prediction-event-001",
+            "target_time": NOW.isoformat().replace("+00:00", "Z"),
+            "generated_at": NOW.isoformat().replace("+00:00", "Z"),
         },
     )
 
@@ -151,6 +196,9 @@ def test_outcome_subscription_only_consumes_stored_imbalance_events() -> None:
     assert subject == Subject.STORED_ELIA_IMBALANCE.value
     assert subject != Subject.RAW_ELIA_IMBALANCE.value
     assert durable == "outcome-builder-v1"
+    prediction_subject, prediction_durable = OUTCOME_PREDICTION_SUBSCRIPTION
+    assert prediction_subject == Subject.STORED_IMBALANCE_PREDICTION.value
+    assert prediction_durable == "outcome-prediction-reconcile-v1"
 
 
 @pytest.mark.asyncio
@@ -180,7 +228,7 @@ async def test_outcome_service_joins_every_matching_prediction_without_mutation(
 
 
 @pytest.mark.asyncio
-async def test_outcome_service_naks_until_a_lagging_prediction_is_available() -> None:
+async def test_outcome_service_acks_an_empty_prediction_set_for_later_reconciliation() -> None:
     trace: list[tuple[str, object]] = []
     repository = FakeOutcomeRepository([])
     bus = RecordingBus(trace)
@@ -188,44 +236,30 @@ async def test_outcome_service_naks_until_a_lagging_prediction_is_available() ->
 
     await OutcomeService(repository, bus).handle(message)
 
-    assert trace == [("nak", 5.0)]
+    assert trace == [("ack", "stored-event-001")]
     assert bus.published == []
-    assert message.nak_delay == 5.0
 
 
 @pytest.mark.asyncio
-async def test_outcome_service_waits_for_the_prediction_settlement_grace_period() -> None:
-    trace: list[tuple[str, object]] = []
-    repository = FakeOutcomeRepository([prediction("first-member", "positive")])
-    bus = RecordingBus(trace)
-    now = NOW
-    service = OutcomeService(repository, bus, clock=lambda: now)
-
-    await service.handle(RecordingMessage(stored_event(), trace))
-    now = NOW + PREDICTION_SETTLEMENT_GRACE
-    await service.handle(RecordingMessage(stored_event(), trace, delivery_count=2))
-
-    assert trace[0] == ("nak", 5.0)
-    assert [subject for subject, _ in bus.published] == [Subject.OUTCOMES_IMBALANCE.value]
-    assert trace[-1] == ("ack", "stored-event-001")
-
-
-@pytest.mark.asyncio
-async def test_outcome_service_dead_letters_missing_predictions_after_bounded_retries() -> None:
+async def test_stored_prediction_triggers_idempotent_reconciliation_after_realization() -> None:
     trace: list[tuple[str, object]] = []
     repository = FakeOutcomeRepository([])
     bus = RecordingBus(trace)
-    message = RecordingMessage(
-        stored_event(),
-        trace,
-        delivery_count=MAX_PENDING_PREDICTION_DELIVERIES,
-    )
+    service = OutcomeService(repository, bus, clock=lambda: NOW + timedelta(minutes=1))
 
-    await OutcomeService(repository, bus).handle(message)
+    await service.handle(RecordingMessage(stored_event(), trace))
+    repository.predictions.append(prediction("first-member", "positive"))
+    await service.handle(RecordingMessage(stored_prediction_event(), trace))
+    repository.predictions.append(prediction("second-member", "negative"))
+    await service.handle(RecordingMessage(stored_prediction_event("stored-prediction-002"), trace))
 
-    assert trace == [("publish", bus.published[0][1].event_id), ("ack", "stored-event-001")]
-    assert bus.published[0][0] == OUTCOME_DLQ_SUBJECT
-    assert bus.published[0][1].payload["reason"] == "delivery_exhausted"
+    prediction_ids = {
+        event.payload["prediction_event_id"]
+        for subject, event in bus.published
+        if subject == Subject.OUTCOMES_IMBALANCE.value
+    }
+    assert prediction_ids == {"first-member", "second-member"}
+    assert repository.version_calls == [(NOW, NOW, NOW + timedelta(minutes=1))] * 2
 
 
 @pytest.mark.asyncio
@@ -239,7 +273,7 @@ async def test_outcome_service_excludes_predictions_generated_after_the_target()
 
     await OutcomeService(repository, bus).handle(message)
 
-    assert trace == [("nak", 5.0)]
+    assert trace == [("ack", "stored-event-001")]
     assert bus.published == []
 
 

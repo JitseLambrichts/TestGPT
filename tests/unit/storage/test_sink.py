@@ -58,6 +58,39 @@ def imbalance_event() -> EventEnvelope:
     )
 
 
+def prediction_source_event() -> EventEnvelope:
+    generated_at = datetime(2026, 7, 13, 10, 1, 7, tzinfo=UTC)
+    target_time = generated_at + timedelta(seconds=53)
+    return EventEnvelope(
+        event_id="prediction-source-001",
+        event_type="imbalance.prediction.generated",
+        schema_version="1",
+        source="predictor",
+        dataset="system-imbalance",
+        event_time=generated_at,
+        observed_at=generated_at,
+        ingested_at=generated_at,
+        correlation_id="feature-event-001",
+        causation_id="feature-event-001",
+        quality_status="model",
+        payload={
+            "cutoff": "2026-07-13T10:01:00Z",
+            "target_time": target_time.isoformat().replace("+00:00", "Z"),
+            "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
+            "system_imbalance_mw": 100.0,
+            "p10_mw": 80.0,
+            "p90_mw": 120.0,
+            "flip_probability": 0.2,
+            "will_flip": False,
+            "current_state": "positive",
+            "predicted_state": "positive",
+            "prediction_quality": "model",
+            "model_version": "model-v1",
+            "feature_schema_hash": "feature-schema-001",
+        },
+    )
+
+
 def routed_events() -> list[tuple[str, dict[str, object], str | None]]:
     timestamp = "2026-07-13T10:01:00Z"
     return [
@@ -859,6 +892,26 @@ async def test_sink_inserts_then_publishes_deterministic_stored_trigger_then_ack
     corrected = bus.published[2][1]
     assert corrected.event_id != stored.event_id
     assert corrected.payload["source_ingested_at"] == "2026-07-13T10:01:06Z"
+
+
+@pytest.mark.asyncio
+async def test_sink_publishes_a_stored_prediction_reconciliation_trigger() -> None:
+    trace: list[tuple[str, object]] = []
+    source = prediction_source_event()
+    bus = RecordingBus(trace)
+
+    await Sink(RecordingRepository(trace), bus).handle(RecordingMessage(source, trace))
+
+    assert trace == [
+        ("insert", source.event_id),
+        ("publish", "grid.stored.prediction.imbalance.v1"),
+        ("ack", source.event_id),
+    ]
+    subject, stored = bus.published[0]
+    assert subject == "grid.stored.prediction.imbalance.v1"
+    assert stored.event_type == "imbalance.prediction.stored"
+    assert stored.event_time == datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    assert stored.payload["prediction_event_id"] == source.event_id
 
 
 @pytest.mark.asyncio

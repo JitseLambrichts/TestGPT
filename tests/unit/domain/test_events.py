@@ -54,9 +54,10 @@ def test_subject_constants_match_the_versioned_grid_contract() -> None:
         "grid.raw.elia.load.v1",
         "grid.raw.elia.wind.v1",
         "grid.raw.elia.solar.v1",
-        "grid.raw.weather.forecast.v1",
-        "grid.stored.elia.imbalance.v1",
-        "grid.features.imbalance.v1",
+            "grid.raw.weather.forecast.v1",
+            "grid.stored.elia.imbalance.v1",
+            "grid.stored.prediction.imbalance.v1",
+            "grid.features.imbalance.v1",
         "grid.predictions.imbalance.v1",
         "grid.outcomes.imbalance.v1",
     )

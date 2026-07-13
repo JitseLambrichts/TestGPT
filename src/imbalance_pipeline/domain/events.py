@@ -14,6 +14,7 @@ class Subject(StrEnum):
     RAW_ELIA_SOLAR = "grid.raw.elia.solar.v1"
     RAW_WEATHER_FORECAST = "grid.raw.weather.forecast.v1"
     STORED_ELIA_IMBALANCE = "grid.stored.elia.imbalance.v1"
+    STORED_IMBALANCE_PREDICTION = "grid.stored.prediction.imbalance.v1"
     FEATURES_IMBALANCE = "grid.features.imbalance.v1"
     PREDICTIONS_IMBALANCE = "grid.predictions.imbalance.v1"
     OUTCOMES_IMBALANCE = "grid.outcomes.imbalance.v1"

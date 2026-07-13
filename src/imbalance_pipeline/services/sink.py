@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Final, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +11,7 @@ from imbalance_pipeline.storage.clickhouse import (
     ClickHouseRepository,
     DeadLetterReason,
     PermanentEventError,
+    Prediction,
     TransientStorageError,
 )
 
@@ -88,6 +89,11 @@ class Sink:
                 Subject.STORED_ELIA_IMBALANCE.value,
                 _stored_event(message.event),
             )
+        elif message.event.event_type == "imbalance.prediction.generated":
+            await self._bus.publish(
+                Subject.STORED_IMBALANCE_PREDICTION.value,
+                _stored_prediction_event(message.event),
+            )
         await message.ack()
         return False
 
@@ -163,9 +169,40 @@ def _stored_event(source: EventEnvelope) -> EventEnvelope:
     )
 
 
+def _stored_prediction_event(source: EventEnvelope) -> EventEnvelope:
+    prediction = Prediction.model_validate({"event_id": source.event_id, **source.payload})
+    return EventEnvelope(
+        event_id=event_id(
+            "clickhouse",
+            "stored-imbalance-prediction",
+            f"{source.event_id}:{source.ingested_at.isoformat()}",
+            source.schema_version,
+        ),
+        event_type="imbalance.prediction.stored",
+        schema_version="1",
+        source="clickhouse",
+        dataset=source.dataset,
+        event_time=prediction.target_time,
+        observed_at=source.observed_at,
+        ingested_at=source.ingested_at,
+        correlation_id=source.correlation_id,
+        causation_id=source.event_id,
+        quality_status=source.quality_status,
+        payload={
+            "prediction_event_id": source.event_id,
+            "target_time": _utc_timestamp(prediction.target_time),
+            "generated_at": _utc_timestamp(prediction.generated_at),
+        },
+    )
+
+
 def _delivery_delay(delivery_count: int) -> float:
     index = max(1, delivery_count) - 1
     return DELIVERY_DELAYS_SECONDS[min(index, len(DELIVERY_DELAYS_SECONDS) - 1)]
+
+
+def _utc_timestamp(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 async def _run_service() -> None:
