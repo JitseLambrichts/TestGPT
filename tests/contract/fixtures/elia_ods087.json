@@ -1,0 +1,45 @@
+{
+  "total_count": 9408,
+  "results": [
+    {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "region": "Namur",
+      "realtime": null,
+      "mostrecentforecast": 0.0,
+      "mostrecentconfidence10": 0.0,
+      "mostrecentconfidence90": 0.0,
+      "dayahead11hforecast": 0.0,
+      "dayahead11hconfidence10": 0.0,
+      "dayahead11hconfidence90": 0.0,
+      "dayaheadforecast": 0.0,
+      "dayaheadconfidence10": 0.0,
+      "dayaheadconfidence90": 0.0,
+      "weekaheadforecast": 0.0,
+      "weekaheadconfidence10": 0.0,
+      "weekaheadconfidence90": 0.0,
+      "loadfactor": 0.0,
+      "monitoredcapacity": 444.557
+    },
+    {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "region": "Walloon-Brabant",
+      "realtime": null,
+      "mostrecentforecast": 0.0,
+      "mostrecentconfidence10": 0.0,
+      "mostrecentconfidence90": 0.0,
+      "dayahead11hforecast": 0.0,
+      "dayahead11hconfidence10": 0.0,
+      "dayahead11hconfidence90": 0.0,
+      "dayaheadforecast": 0.0,
+      "dayaheadconfidence10": 0.0,
+      "dayaheadconfidence90": 0.0,
+      "weekaheadforecast": 0.0,
+      "weekaheadconfidence10": 0.0,
+      "weekaheadconfidence90": 0.0,
+      "loadfactor": 0.0,
+      "monitoredcapacity": 358.197
+    }
+  ]
+}

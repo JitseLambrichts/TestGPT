@@ -1,0 +1,51 @@
+{
+  "total_count": 3360,
+  "results": [
+    {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "offshoreonshore": "Onshore",
+      "region": "Flanders",
+      "gridconnectiontype": "Elia",
+      "realtime": null,
+      "mostrecentforecast": 37.0,
+      "mostrecentconfidence10": 11.9,
+      "mostrecentconfidence90": 119.1,
+      "dayahead11hforecast": 37.0,
+      "dayahead11hconfidence10": 11.9,
+      "dayahead11hconfidence90": 119.1,
+      "dayaheadforecast": 37.0,
+      "dayaheadconfidence10": 11.9,
+      "dayaheadconfidence90": 119.1,
+      "weekaheadforecast": 39.9,
+      "weekaheadconfidence10": 10.4,
+      "weekaheadconfidence90": 128.2,
+      "monitoredcapacity": 333.4,
+      "loadfactor": null,
+      "decrementalbidid": null
+    },
+    {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "offshoreonshore": "Onshore",
+      "region": "Wallonia",
+      "gridconnectiontype": "Elia",
+      "realtime": null,
+      "mostrecentforecast": 17.2,
+      "mostrecentconfidence10": 4.2,
+      "mostrecentconfidence90": 69.1,
+      "dayahead11hforecast": 17.2,
+      "dayahead11hconfidence10": 4.2,
+      "dayahead11hconfidence90": 69.1,
+      "dayaheadforecast": 17.2,
+      "dayaheadconfidence10": 4.2,
+      "dayaheadconfidence90": 69.1,
+      "weekaheadforecast": 16.0,
+      "weekaheadconfidence10": 5.7,
+      "weekaheadconfidence90": 66.8,
+      "monitoredcapacity": 186.2,
+      "loadfactor": null,
+      "decrementalbidid": null
+    }
+  ]
+}

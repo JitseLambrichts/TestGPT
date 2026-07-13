@@ -1,8 +1,9 @@
 import asyncio
 import json
 import random
-from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Iterator, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
 import httpx
@@ -13,6 +14,18 @@ from imbalance_pipeline.domain.imbalance import ImbalanceObservation
 DEFAULT_ELIA_BASE_URL = "https://opendata.elia.be/api/explore/v2.1"
 ELIA_TIMEOUT = httpx.Timeout(10.0, connect=10.0, read=10.0)
 MAX_ATTEMPTS = 5
+MAX_PAGE_SIZE = 100
+MAX_RESULT_WINDOW = 10_000
+DATASET_ORDER_BY = {
+    "ods086": "datetime asc, offshoreonshore asc, region asc, gridconnectiontype asc",
+    "ods087": "datetime asc, region asc",
+}
+
+
+@dataclass(frozen=True)
+class _EliaPage:
+    total_count: int
+    records: list[dict[str, object]]
 
 
 class _TimedEliaRecord(BaseModel):
@@ -162,15 +175,21 @@ def normalize_imbalance(record: Mapping[str, object]) -> ImbalanceObservation:
 
 
 def normalize_load(record: Mapping[str, object]) -> LoadObservation:
-    return LoadObservation.model_validate(record)
+    observation = LoadObservation.model_validate(record)
+    _require_quarter_hour_resolution(observation.resolution_code, "ODS002")
+    return observation
 
 
 def normalize_wind(record: Mapping[str, object]) -> WindObservation:
-    return WindObservation.model_validate(record)
+    observation = WindObservation.model_validate(record)
+    _require_quarter_hour_resolution(observation.resolution_code, "ODS086")
+    return observation
 
 
 def normalize_solar(record: Mapping[str, object]) -> SolarObservation:
-    return SolarObservation.model_validate(record)
+    observation = SolarObservation.model_validate(record)
+    _require_quarter_hour_resolution(observation.resolution_code, "ODS087")
+    return observation
 
 
 class EliaClient:
@@ -181,8 +200,8 @@ class EliaClient:
         page_size: int = 100,
         retry_base_seconds: float = 0.25,
     ) -> None:
-        if page_size <= 0:
-            raise ValueError("page_size must be positive")
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError("page_size must be between 1 and 100")
         if retry_base_seconds < 0:
             raise ValueError("retry_base_seconds cannot be negative")
         self._base_url = base_url.rstrip("/")
@@ -214,6 +233,17 @@ class EliaClient:
         where: str | None,
         order_by: str,
     ) -> list[dict[str, object]]:
+        page = await self._fetch_page(dataset, limit, offset, where, order_by)
+        return page.records
+
+    async def _fetch_page(
+        self,
+        dataset: str,
+        limit: int,
+        offset: int,
+        where: str | None,
+        order_by: str,
+    ) -> _EliaPage:
         url = f"{self._base_url}/catalog/datasets/{quote(dataset, safe='')}/records"
         params: dict[str, str | int] = {
             "limit": limit,
@@ -241,7 +271,7 @@ class EliaClient:
                     await self._wait_before_retry(attempt)
                     continue
             response.raise_for_status()
-            return _response_records(response)
+            return _response_page(response)
 
         raise RuntimeError("unreachable retry state")
 
@@ -253,27 +283,75 @@ class EliaClient:
     ) -> AsyncIterator[dict[str, object]]:
         start_utc = _normalize_query_boundary(start)
         end_utc = _normalize_query_boundary(end)
+        for window_start, window_end in _query_windows(start_utc, end_utc):
+            async for record in self._iter_window(
+                dataset,
+                window_start,
+                window_end,
+            ):
+                yield record
+
+    async def _iter_window(
+        self,
+        dataset: str,
+        start: datetime | None,
+        end: datetime | None,
+    ) -> AsyncIterator[dict[str, object]]:
         conditions: list[str] = []
-        if start_utc is not None:
-            conditions.append(f"datetime >= {_query_string(start_utc.isoformat())}")
-        if end_utc is not None:
-            conditions.append(f"datetime < {_query_string(end_utc.isoformat())}")
+        if start is not None:
+            conditions.append(f"datetime >= {_query_string(start.isoformat())}")
+        if end is not None:
+            conditions.append(f"datetime < {_query_string(end.isoformat())}")
         where = " AND ".join(conditions) or None
 
         offset = 0
+        consumed = 0
+        expected_total: int | None = None
+        seen_pages: set[str] = set()
         while True:
-            page = await self.fetch_page(
+            if offset + self._page_size >= MAX_RESULT_WINDOW:
+                raise RuntimeError("Explore pagination would reach the 10,000-row result window")
+            page = await self._fetch_page(
                 dataset=dataset,
                 limit=self._page_size,
                 offset=offset,
                 where=where,
-                order_by="datetime asc",
+                order_by=DATASET_ORDER_BY.get(dataset.lower(), "datetime asc"),
             )
-            for record in page:
-                yield record
-            if len(page) < self._page_size:
+            if expected_total is None:
+                expected_total = page.total_count
+                if _last_request_reaches_result_limit(expected_total, self._page_size):
+                    raise RuntimeError(
+                        "Explore query exceeds the safe result window; use a narrower time range"
+                    )
+            if consumed >= expected_total:
+                if page.records:
+                    raise RuntimeError("Explore returned records beyond total_count")
                 return
-            offset += len(page)
+            if not page.records:
+                raise RuntimeError("Explore pagination made no progress before total_count")
+
+            fingerprint = json.dumps(
+                page.records,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if fingerprint in seen_pages:
+                raise RuntimeError("Explore pagination returned a repeated page")
+            seen_pages.add(fingerprint)
+
+            remaining = expected_total - consumed
+            if len(page.records) > remaining:
+                raise RuntimeError("Explore returned more records than total_count")
+            for record in page.records:
+                yield record
+            consumed += len(page.records)
+            if consumed == expected_total:
+                return
+            if len(page.records) < self._page_size:
+                raise RuntimeError("Explore pagination made no progress before total_count")
+            offset += len(page.records)
 
     async def _wait_before_retry(self, attempt: int) -> None:
         ceiling = self._retry_base_seconds * 2**attempt
@@ -296,10 +374,13 @@ def _query_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
-def _response_records(response: httpx.Response) -> list[dict[str, object]]:
+def _response_page(response: httpx.Response) -> _EliaPage:
     payload: object = response.json()
     if not isinstance(payload, dict):
         raise ValueError("Elia response must be a JSON object")
+    total_count = payload.get("total_count")
+    if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+        raise ValueError("Elia response must contain a non-negative total_count")
     results = payload.get("results")
     if not isinstance(results, list):
         raise ValueError("Elia response must contain a results list")
@@ -309,4 +390,36 @@ def _response_records(response: httpx.Response) -> list[dict[str, object]]:
         if not isinstance(result, dict) or not all(isinstance(key, str) for key in result):
             raise ValueError("Elia result records must be JSON objects with string keys")
         records.append(result)
-    return records
+    return _EliaPage(total_count=total_count, records=records)
+
+
+def _require_quarter_hour_resolution(resolution_code: str, dataset: str) -> None:
+    if resolution_code != "PT15M":
+        raise ValueError(f"{dataset} quarter-hour observations require PT15M")
+
+
+def _query_windows(
+    start: datetime | None,
+    end: datetime | None,
+) -> Iterator[tuple[datetime | None, datetime | None]]:
+    if start is None or end is None:
+        yield start, end
+        return
+    cursor = start
+    while cursor < end:
+        next_midnight = (cursor + timedelta(days=1)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        window_end = min(next_midnight, end)
+        yield cursor, window_end
+        cursor = window_end
+
+
+def _last_request_reaches_result_limit(total_count: int, page_size: int) -> bool:
+    if total_count == 0:
+        return False
+    last_offset = ((total_count - 1) // page_size) * page_size
+    return last_offset + page_size >= MAX_RESULT_WINDOW

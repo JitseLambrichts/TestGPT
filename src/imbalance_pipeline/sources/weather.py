@@ -1,4 +1,6 @@
+import asyncio
 import math
+import random
 import statistics
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -10,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, field_validator
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 WEATHER_TIMEOUT = httpx.Timeout(10.0, connect=10.0, read=10.0)
+MAX_ATTEMPTS = 5
+CIRCULAR_RESULTANT_TOLERANCE = 1e-12
 WEATHER_VARIABLES = (
     "temperature_2m",
     "cloud_cover",
@@ -72,11 +76,15 @@ class WeatherClient:
         enabled: bool = False,
         client: httpx.AsyncClient | None = None,
         clock: Callable[[], datetime] | None = None,
+        retry_base_seconds: float = 0.25,
     ) -> None:
+        if retry_base_seconds < 0:
+            raise ValueError("retry_base_seconds cannot be negative")
         self._enabled = enabled
         self._client = client or httpx.AsyncClient()
         self._owns_client = client is None
         self._clock = clock or _utc_now
+        self._retry_base_seconds = retry_base_seconds
 
     async def __aenter__(self) -> "WeatherClient":
         return self
@@ -108,14 +116,12 @@ class WeatherClient:
             raise ValueError("weather start must be before end")
 
         endpoint = HISTORICAL_FORECAST_URL if historical else FORECAST_URL
-        response = await self._client.get(
+        response, receipt_time = await self._get_with_retry(
             endpoint,
-            params=_weather_query(start_utc, end_utc),
-            timeout=WEATHER_TIMEOUT,
+            _weather_query(start_utc, end_utc),
+            capture_receipt_time=not historical,
         )
-        response.raise_for_status()
         payloads = _weather_payloads(response)
-        receipt_time = _normalize_boundary(self._clock())
 
         point_hours = [_point_hourly(payload) for payload in payloads]
         reference_times = point_hours[0]["time"]
@@ -127,7 +133,12 @@ class WeatherClient:
             valid_time = _open_meteo_utc_time(source_time)
             if valid_time < start_utc or valid_time >= end_utc:
                 continue
-            available_at = valid_time if historical else receipt_time
+            if historical:
+                available_at = valid_time
+            else:
+                if receipt_time is None:
+                    raise RuntimeError("live weather receipt time was not captured")
+                available_at = receipt_time
             if available_at > end_utc:
                 continue
             yield WeatherForecast(
@@ -139,6 +150,42 @@ class WeatherClient:
                     for variable in WEATHER_VARIABLES
                 },
             )
+
+    async def _get_with_retry(
+        self,
+        endpoint: str,
+        params: Mapping[str, str],
+        capture_receipt_time: bool,
+    ) -> tuple[httpx.Response, datetime | None]:
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                response = await self._client.get(
+                    endpoint,
+                    params=params,
+                    timeout=WEATHER_TIMEOUT,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise
+                await self._wait_before_retry(attempt)
+                continue
+
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < MAX_ATTEMPTS - 1:
+                    await self._wait_before_retry(attempt)
+                    continue
+            if response.is_success:
+                receipt_time = (
+                    _normalize_boundary(self._clock()) if capture_receipt_time else None
+                )
+                return response, receipt_time
+            response.raise_for_status()
+
+        raise RuntimeError("unreachable retry state")
+
+    async def _wait_before_retry(self, attempt: int) -> None:
+        ceiling = self._retry_base_seconds * 2**attempt
+        await asyncio.sleep(random.uniform(0.0, ceiling))
 
 
 def _utc_now() -> datetime:
@@ -248,7 +295,9 @@ def _aggregate_variable(
     )
 
 
-def _circular_mean_degrees(values: Sequence[float]) -> float:
+def _circular_mean_degrees(values: Sequence[float]) -> float | None:
     sine = statistics.fmean(math.sin(math.radians(value)) for value in values)
     cosine = statistics.fmean(math.cos(math.radians(value)) for value in values)
+    if math.hypot(sine, cosine) < CIRCULAR_RESULTANT_TOLERANCE:
+        return None
     return math.degrees(math.atan2(sine, cosine)) % 360.0

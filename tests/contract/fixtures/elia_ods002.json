@@ -1,0 +1,29 @@
+{
+  "total_count": 480,
+  "results": [
+    {
+      "datetime": "2026-07-17T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "measured": null,
+      "mostrecentforecast": 8597.61,
+      "mostrecentconfidence10": 7845.65,
+      "mostrecentconfidence90": 9349.57,
+      "dayaheadforecast": 8597.61,
+      "dayaheadconfidence10": 7845.65,
+      "dayaheadconfidence90": 9349.57,
+      "weekaheadforecast": 8714.32
+    },
+    {
+      "datetime": "2026-07-17T21:30:00+00:00",
+      "resolutioncode": "PT15M",
+      "measured": null,
+      "mostrecentforecast": 8715.87,
+      "mostrecentconfidence10": 7953.57,
+      "mostrecentconfidence90": 9478.17,
+      "dayaheadforecast": 8715.87,
+      "dayaheadconfidence10": 7953.57,
+      "dayaheadconfidence90": 9478.17,
+      "weekaheadforecast": 8843.17
+    }
+  ]
+}
