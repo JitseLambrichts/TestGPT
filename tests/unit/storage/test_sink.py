@@ -434,6 +434,60 @@ async def test_latest_prediction_returns_none_for_an_empty_table() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_predictions_for_target_returns_each_canonical_prediction() -> None:
+    client = RecordingClickHouseClient()
+    client.query_rows = [
+        (
+            "prediction-event-001",
+            datetime(2026, 7, 13, 10, 1),
+            datetime(2026, 7, 13, 10, 2),
+            datetime(2026, 7, 13, 10, 1, 7),
+            120.0,
+            80.0,
+            160.0,
+            0.25,
+            0,
+            "positive",
+            "positive",
+            "model",
+            "model-v1",
+            "feature-schema-001",
+        ),
+        (
+            "prediction-event-002",
+            datetime(2026, 7, 13, 10, 1),
+            datetime(2026, 7, 13, 10, 2),
+            datetime(2026, 7, 13, 10, 1, 8),
+            -120.0,
+            -160.0,
+            -80.0,
+            0.75,
+            1,
+            "negative",
+            "positive",
+            "model",
+            "model-v2",
+            "feature-schema-001",
+        ),
+    ]
+    target = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+
+    predictions = await repository_with(client).fetch_predictions_for_target(target)
+
+    assert [prediction.event_id for prediction in predictions] == [
+        "prediction-event-001",
+        "prediction-event-002",
+    ]
+    assert predictions[1].will_flip is True
+    query, parameters, settings = client.queries[0]
+    assert "GROUP BY event_id" in query
+    assert "argMax" in query
+    assert "FINAL" not in query.upper()
+    assert parameters == {"target_time": target}
+    assert settings["tz_mode"] == "aware"
+
+
+@pytest.mark.asyncio
 async def test_repository_validates_then_inserts_exact_raw_envelope_before_normalized_row() -> None:
     client = RecordingClickHouseClient()
     repository = repository_with(client)

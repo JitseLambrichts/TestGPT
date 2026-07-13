@@ -733,6 +733,45 @@ class ClickHouseRepository:
             values[field_name] = _clickhouse_utc(cast(datetime, values[field_name]))
         return Prediction.model_validate(values)
 
+    async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]:
+        target = _clickhouse_utc(target_time)
+        query = f"""
+            SELECT
+                event_id,
+                argMax(cutoff, row_version) AS cutoff,
+                argMax(target_time, row_version) AS prediction_target_time,
+                argMax(generated_at, row_version) AS generated_at,
+                argMax(system_imbalance_mw, row_version) AS system_imbalance_mw,
+                argMax(p10_mw, row_version) AS p10_mw,
+                argMax(p90_mw, row_version) AS p90_mw,
+                argMax(flip_probability, row_version) AS flip_probability,
+                argMax(will_flip, row_version) AS will_flip,
+                argMax(current_state, row_version) AS current_state,
+                argMax(predicted_state, row_version) AS predicted_state,
+                argMax(prediction_quality, row_version) AS prediction_quality,
+                argMax(model_version, row_version) AS model_version,
+                argMax(feature_schema_hash, row_version) AS feature_schema_hash
+            FROM {self._database}.predictions
+            WHERE target_time = {{target_time:DateTime64(3, 'UTC')}}
+            GROUP BY event_id
+            ORDER BY event_id
+        """
+        try:
+            result = await self._client.query(
+                query,
+                parameters={"target_time": target},
+                tz_mode="aware",
+            )
+        except (ClickHouseError, OSError, TimeoutError) as exc:
+            raise TransientStorageError from exc
+        predictions: list[Prediction] = []
+        for row in result.result_rows:
+            values = dict(zip(PREDICTION_COLUMNS[:-1], row, strict=True))
+            for field_name in ("cutoff", "target_time", "generated_at"):
+                values[field_name] = _clickhouse_utc(cast(datetime, values[field_name]))
+            predictions.append(Prediction.model_validate(values))
+        return predictions
+
     async def _insert(self, prepared: _PreparedInsert) -> None:
         await self._client.insert(
             f"{self._database}.{prepared.table}",

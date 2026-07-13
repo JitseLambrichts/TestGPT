@@ -76,6 +76,36 @@ def event(
     )
 
 
+def prediction_event(*, event_id: str, target_time: datetime) -> EventEnvelope:
+    generated_at = target_time - timedelta(minutes=1) + timedelta(seconds=10)
+    return EventEnvelope(
+        event_id=event_id,
+        event_type="imbalance.prediction.generated",
+        source="predictor",
+        dataset="system-imbalance",
+        event_time=generated_at,
+        observed_at=generated_at,
+        ingested_at=generated_at,
+        correlation_id=event_id,
+        quality_status="model",
+        payload={
+            "cutoff": (target_time - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            "target_time": target_time.isoformat().replace("+00:00", "Z"),
+            "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
+            "system_imbalance_mw": 100.0,
+            "p10_mw": 80.0,
+            "p90_mw": 120.0,
+            "flip_probability": 0.2,
+            "will_flip": False,
+            "current_state": "positive",
+            "predicted_state": "positive",
+            "prediction_quality": "model",
+            "model_version": "model-v1",
+            "feature_schema_hash": "feature-schema-001",
+        },
+    )
+
+
 async def migrated_client() -> AsyncClient:
     assert CLICKHOUSE_URL is not None
     assert CLICKHOUSE_ADMIN_USER is not None
@@ -251,6 +281,26 @@ async def test_source_version_migration_is_safe_to_rerun() -> None:
 
         assert "ORDER BY (timestamp, event_id, row_version)" in str(created.first_row[0])
         assert [observation.system_imbalance_mw for observation in observations] == [123.0]
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_predictions_for_a_realized_target_are_read_without_waiting_for_merges() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    target = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    try:
+        await repository.insert_event(prediction_event(event_id="prediction-a", target_time=target))
+        await repository.insert_event(prediction_event(event_id="prediction-b", target_time=target))
+
+        predictions = await repository.fetch_predictions_for_target(target)
+
+        assert [prediction.event_id for prediction in predictions] == [
+            "prediction-a",
+            "prediction-b",
+        ]
+        assert all(prediction.target_time == target for prediction in predictions)
     finally:
         await repository.aclose()
 
