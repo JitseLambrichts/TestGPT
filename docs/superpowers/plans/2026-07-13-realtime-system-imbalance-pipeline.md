@@ -1185,10 +1185,11 @@ down:
 	docker compose down
 
 clean:
+	@test "$$CONFIRM_CLEAN" = "1" || (echo "Set CONFIRM_CLEAN=1 to remove local volumes" && exit 1)
 	docker compose down --volumes --remove-orphans
 ~~~
 
-Document in the target help that clean destroys local pipeline data and require CONFIRM_CLEAN=1 before executing the destructive command.
+Document in the target help that clean destroys local pipeline data.
 
 - [ ] **Step 8: Verify container configuration**
 
