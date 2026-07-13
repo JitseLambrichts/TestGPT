@@ -3,9 +3,16 @@ import pytest
 from imbalance_pipeline.domain.imbalance import ConfirmedState, advance_state, flip_label
 
 
-def test_exact_deadband_boundaries_retain_confirmed_state() -> None:
-    assert advance_state(ConfirmedState.POSITIVE, 10.0, 10.0) is ConfirmedState.POSITIVE
-    assert advance_state(ConfirmedState.NEGATIVE, -10.0, 10.0) is ConfirmedState.NEGATIVE
+@pytest.mark.parametrize(
+    "previous",
+    [None, ConfirmedState.POSITIVE, ConfirmedState.NEGATIVE],
+)
+@pytest.mark.parametrize("value_mw", [-10.0, 0.0, 10.0])
+def test_neutral_band_including_boundaries_retains_previous_state(
+    previous: ConfirmedState | None,
+    value_mw: float,
+) -> None:
+    assert advance_state(previous, value_mw, 10.0) is previous
 
 
 def test_values_outside_deadband_establish_state() -> None:

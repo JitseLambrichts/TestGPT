@@ -127,9 +127,19 @@ def test_imbalance_observation_uses_utc_datetimes_and_float_source_values() -> N
 
 
 @pytest.mark.parametrize("field", ["timestamp", "quarter_hour"])
-def test_imbalance_observation_rejects_non_utc_datetimes(field: str) -> None:
+@pytest.mark.parametrize(
+    "invalid_datetime",
+    [
+        datetime(2026, 7, 13, 10, 1),
+        datetime(2026, 7, 13, 10, 1, tzinfo=timezone(timedelta(hours=2))),
+    ],
+)
+def test_imbalance_observation_rejects_non_utc_datetimes(
+    field: str,
+    invalid_datetime: datetime,
+) -> None:
     values = observation().model_dump()
-    values[field] = datetime(2026, 7, 13, 10, 1, tzinfo=timezone(timedelta(hours=2)))
+    values[field] = invalid_datetime
 
     with pytest.raises(ValidationError, match="UTC"):
         ImbalanceObservation.model_validate(values)
