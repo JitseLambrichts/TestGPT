@@ -106,6 +106,7 @@ class WeatherClient:
         start: datetime,
         end: datetime,
         historical: bool,
+        availability_cutoff: datetime | None = None,
     ) -> AsyncIterator[WeatherForecast]:
         if not self._enabled:
             return
@@ -114,6 +115,11 @@ class WeatherClient:
         end_utc = _normalize_boundary(end)
         if start_utc >= end_utc:
             raise ValueError("weather start must be before end")
+        cutoff_utc = (
+            _normalize_boundary(availability_cutoff)
+            if availability_cutoff is not None
+            else None
+        )
 
         endpoint = HISTORICAL_FORECAST_URL if historical else FORECAST_URL
         response, receipt_time = await self._get_with_retry(
@@ -139,7 +145,7 @@ class WeatherClient:
                 if receipt_time is None:
                     raise RuntimeError("live weather receipt time was not captured")
                 available_at = receipt_time
-            if available_at > end_utc:
+            if cutoff_utc is not None and available_at > cutoff_utc:
                 continue
             yield WeatherForecast(
                 valid_time=valid_time,

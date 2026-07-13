@@ -68,6 +68,7 @@ class EventEnvelope(BaseModel):
         natural_key: str,
         payload: BaseModel,
         quality_status: str,
+        observed_at: datetime | None = None,
     ) -> Self:
         identifier = event_id(source, dataset, natural_key)
         return cls(
@@ -76,6 +77,7 @@ class EventEnvelope(BaseModel):
             source=source,
             dataset=dataset,
             event_time=event_time,
+            observed_at=observed_at,
             correlation_id=identifier,
             quality_status=quality_status,
             payload=payload.model_dump(mode="json"),

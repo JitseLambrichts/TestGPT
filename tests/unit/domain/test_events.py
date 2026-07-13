@@ -87,6 +87,37 @@ def test_envelope_create_preserves_transport_neutral_contract_fields() -> None:
     assert created.ingested_at.utcoffset() == timedelta(0)
 
 
+def test_envelope_factory_accepts_and_validates_observed_at() -> None:
+    observed_at = datetime(2026, 7, 13, 10, 1, 5, tzinfo=UTC)
+
+    created = EventEnvelope.create(
+        event_type="elia.imbalance.observed",
+        source="elia",
+        dataset="ods161",
+        event_time=observation().timestamp,
+        natural_key="2026-07-13T10:01:00Z",
+        payload=observation(),
+        quality_status="Validated",
+        observed_at=observed_at,
+    )
+
+    assert created.observed_at == observed_at
+
+
+def test_envelope_factory_rejects_an_unvalidated_observed_at() -> None:
+    with pytest.raises(ValidationError, match="UTC"):
+        EventEnvelope.create(
+            event_type="elia.imbalance.observed",
+            source="elia",
+            dataset="ods161",
+            event_time=observation().timestamp,
+            natural_key="2026-07-13T10:01:00Z",
+            payload=observation(),
+            quality_status="Validated",
+            observed_at=datetime(2026, 7, 13, 10, 1, 5),
+        )
+
+
 def test_envelope_json_round_trip_is_lossless() -> None:
     created = envelope()
 

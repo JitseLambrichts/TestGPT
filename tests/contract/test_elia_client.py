@@ -680,6 +680,7 @@ async def test_weather_drops_rows_available_after_feature_cutoff(
                 datetime(2026, 7, 13, 12, tzinfo=UTC),
                 datetime(2026, 7, 13, 14, tzinfo=UTC),
                 historical=False,
+                availability_cutoff=datetime(2026, 7, 13, 14, tzinfo=UTC),
             )
         ]
 

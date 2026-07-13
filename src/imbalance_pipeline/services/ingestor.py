@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -51,7 +52,14 @@ class WeatherSource(Protocol):
         start: datetime,
         end: datetime,
         historical: bool,
+        availability_cutoff: datetime | None = None,
     ) -> AsyncIterator[WeatherForecast]: ...
+
+
+class _ManagedEventBus(EventBus, Protocol):
+    async def ensure_grid_stream(self) -> None: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,8 +71,8 @@ class PollIntervals:
     weather: float = 900.0
 
     def __post_init__(self) -> None:
-        if any(interval <= 0 for interval in self.values()):
-            raise ValueError("poll intervals must be positive")
+        if any(interval <= 0 or not math.isfinite(interval) for interval in self.values()):
+            raise ValueError("poll intervals must be positive and finite")
 
     def values(self) -> tuple[float, float, float, float, float]:
         return self.imbalance, self.load, self.wind, self.solar, self.weather
@@ -200,7 +208,10 @@ class Ingestor:
                     source="open-meteo",
                     dataset=WEATHER_DATASET,
                     event_time=forecast.valid_time,
-                    natural_key=_timestamp_key(forecast.valid_time),
+                    natural_key=_dimension_key(
+                        timestamp=forecast.valid_time,
+                        available_at=_timestamp_key(forecast.available_at),
+                    ),
                     payload=forecast,
                     quality_status="not_provided",
                     observed_at=forecast.available_at,
@@ -285,9 +296,8 @@ class Ingestor:
             natural_key=natural_key,
             payload=payload,
             quality_status=quality_status,
+            observed_at=observed_at,
         )
-        if observed_at is not None:
-            event = event.model_copy(update={"observed_at": observed_at})
         await self._bus.publish(subject, event)
         self._published.labels(source=source, dataset=dataset).inc()
 
@@ -320,7 +330,7 @@ class Ingestor:
 
             deadline += interval
             now = self._monotonic()
-            if deadline <= now:
+            if deadline < now:
                 missed_intervals = int((now - deadline) // interval) + 1
                 deadline += missed_intervals * interval
             await self._sleep(deadline - now)
@@ -396,11 +406,28 @@ def _utc_now() -> datetime:
 async def _run_service() -> None:
     settings = get_settings()
     nats_module = importlib.import_module("imbalance_pipeline.messaging.nats")
-    bus = await nats_module.NatsEventBus.connect(settings)
-    await bus.ensure_grid_stream()
-    try:
+
+    async def serve(bus: _ManagedEventBus) -> None:
         async with EliaClient(base_url=settings.elia_base_url) as client:
             await Ingestor(client=client, bus=bus, settings=settings).run_forever()
+
+    await _run_with_event_bus(
+        settings=settings,
+        connect=nats_module.NatsEventBus.connect,
+        serve=serve,
+    )
+
+
+async def _run_with_event_bus(
+    *,
+    settings: Settings,
+    connect: Callable[[Settings], Awaitable[_ManagedEventBus]],
+    serve: Callable[[_ManagedEventBus], Awaitable[None]],
+) -> None:
+    bus = await connect(settings)
+    try:
+        await bus.ensure_grid_stream()
+        await serve(bus)
     finally:
         await bus.aclose()
 
