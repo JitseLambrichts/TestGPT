@@ -1,1 +1,31 @@
 .worktrees/
+
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and tool state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage output
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment
+.env
+
+# Local service state
+clickhouse-data/
+nats-data/
+data/clickhouse/
+data/nats/
+
+# Generated datasets and training artifacts
+data/exports/
+runs/
+models/production/

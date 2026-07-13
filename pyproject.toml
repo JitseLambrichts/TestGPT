@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imbalance-pipeline"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "clickhouse-connect>=0.8,<1",
+  "fastapi>=0.115,<1",
+  "holidays>=0.67,<1",
+  "httpx>=0.28,<1",
+  "nats-py>=2.10,<3",
+  "numpy>=2.1,<3",
+  "prometheus-client>=0.21,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "tenacity>=9,<10",
+  "uvicorn[standard]>=0.34,<1"
+]
+
+[project.optional-dependencies]
+ml = [
+  "onnx>=1.17,<2",
+  "onnxruntime>=1.20,<2",
+  "scikit-learn>=1.6,<2",
+  "scipy>=1.15,<2",
+  "torch>=2.6,<3"
+]
+test = [
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "pytest-cov>=6,<7",
+  "respx>=0.22,<1",
+  "ruff>=0.9,<1"
+]
+
+[project.scripts]
+imbalance-ingestor = "imbalance_pipeline.services.ingestor:main"
+imbalance-sink = "imbalance_pipeline.services.sink:main"
+imbalance-features = "imbalance_pipeline.services.features:main"
+imbalance-predictor = "imbalance_pipeline.services.predictor:main"
+imbalance-outcomes = "imbalance_pipeline.services.outcomes:main"
+imbalance-train = "imbalance_pipeline.training.train:main"
+imbalance-export = "imbalance_pipeline.training.export_data:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imbalance_pipeline"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: requires Docker services",
+  "live: calls an external API"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["imbalance_pipeline"]
