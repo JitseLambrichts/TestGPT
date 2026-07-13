@@ -1,6 +1,6 @@
-CREATE DATABASE IF NOT EXISTS {{database}};
+CREATE DATABASE IF NOT EXISTS imbalance;
 
-CREATE TABLE IF NOT EXISTS {{database}}.schema_migrations
+CREATE TABLE IF NOT EXISTS imbalance.schema_migrations
 (
     version UInt32,
     name String,
@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS {{database}}.schema_migrations
 ENGINE = ReplacingMergeTree(applied_at)
 ORDER BY version;
 
-CREATE TABLE IF NOT EXISTS {{database}}.raw_events
+CREATE TABLE IF NOT EXISTS imbalance.raw_events
 (
     event_id String,
     event_type LowCardinality(String),
@@ -32,7 +32,7 @@ PARTITION BY toYYYYMM(event_time)
 ORDER BY (event_id, event_time)
 TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE;
 
-CREATE TABLE IF NOT EXISTS {{database}}.imbalance_observations
+CREATE TABLE IF NOT EXISTS imbalance.imbalance_observations
 (
     event_id String,
     timestamp DateTime64(3, 'UTC'),
@@ -53,7 +53,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.load_observations
+CREATE TABLE IF NOT EXISTS imbalance.load_observations
 (
     event_id String,
     timestamp DateTime64(3, 'UTC'),
@@ -75,7 +75,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.wind_observations
+CREATE TABLE IF NOT EXISTS imbalance.wind_observations
 (
     event_id String,
     timestamp DateTime64(3, 'UTC'),
@@ -106,7 +106,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, offshore_onshore, region, grid_connection_type, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.solar_observations
+CREATE TABLE IF NOT EXISTS imbalance.solar_observations
 (
     event_id String,
     timestamp DateTime64(3, 'UTC'),
@@ -134,7 +134,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, region, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.feature_snapshots
+CREATE TABLE IF NOT EXISTS imbalance.feature_snapshots
 (
     event_id String,
     cutoff DateTime64(3, 'UTC'),
@@ -154,7 +154,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(target_time)
 ORDER BY (target_time, feature_schema_hash, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.predictions
+CREATE TABLE IF NOT EXISTS imbalance.predictions
 (
     event_id String,
     cutoff DateTime64(3, 'UTC'),
@@ -176,7 +176,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(target_time)
 ORDER BY (target_time, model_version, event_id);
 
-CREATE TABLE IF NOT EXISTS {{database}}.prediction_outcomes
+CREATE TABLE IF NOT EXISTS imbalance.prediction_outcomes
 (
     prediction_event_id String,
     target_time DateTime64(3, 'UTC'),
@@ -191,7 +191,7 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(target_time)
 ORDER BY (prediction_event_id, target_time);
 
-CREATE TABLE IF NOT EXISTS {{database}}.model_versions
+CREATE TABLE IF NOT EXISTS imbalance.model_versions
 (
     model_version String,
     feature_schema_hash String,
@@ -205,4 +205,4 @@ ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (model_version, feature_schema_hash);
 
-GRANT SELECT, INSERT ON {{database}}.* TO imbalance;
+GRANT SELECT, INSERT ON imbalance.* TO imbalance;

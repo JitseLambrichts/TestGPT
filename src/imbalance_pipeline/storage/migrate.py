@@ -172,7 +172,13 @@ def _sql_statements(contents: str) -> Iterable[str]:
 
 
 def _render_sql(template: str, database: str) -> str:
-    return template.replace("{{database}}", database)
+    return (
+        template.replace(
+            "CREATE DATABASE IF NOT EXISTS imbalance",
+            f"CREATE DATABASE IF NOT EXISTS {database}",
+        )
+        .replace("imbalance.", f"{database}.")
+    )
 
 
 def _checksum_text(value: object) -> str:
