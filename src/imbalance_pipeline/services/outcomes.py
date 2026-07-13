@@ -1,5 +1,6 @@
 import asyncio
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -24,6 +25,7 @@ OUTCOME_DLQ_SUBJECT: Final = "grid.dlq.outcomes.v1"
 OUTCOME_SUBSCRIPTION: Final = (Subject.STORED_ELIA_IMBALANCE.value, "outcome-builder-v1")
 MAX_PENDING_PREDICTION_DELIVERIES: Final = 5
 PENDING_PREDICTION_DELAY_SECONDS: Final = 5.0
+PREDICTION_SETTLEMENT_GRACE: Final = timedelta(seconds=5)
 
 
 class PendingPredictionError(RuntimeError):
@@ -66,12 +68,14 @@ class OutcomeService:
         bus: EventBus,
         *,
         deadband_mw: float = 10.0,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if deadband_mw <= 0:
             raise ValueError("deadband_mw must be positive")
         self._repository = repository
         self._bus = bus
         self._deadband_mw = deadband_mw
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def handle(self, message: Message) -> None:
         try:
@@ -80,6 +84,8 @@ class OutcomeService:
             await self._reject(message, _invalid_reason(message.event))
             return
         try:
+            if self._prediction_settlement_pending(message.event):
+                raise PendingPredictionError("prediction settlement grace period has not elapsed")
             outcomes = await self._build_outcomes(message.event, trigger)
         except PendingPredictionError:
             if message.delivery_count >= MAX_PENDING_PREDICTION_DELIVERIES:
@@ -138,6 +144,12 @@ class OutcomeService:
             )
             for prediction in eligible_predictions
         ]
+
+    def _prediction_settlement_pending(self, event: EventEnvelope) -> bool:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
+            raise ValueError("outcome settlement clock must be UTC-aware")
+        return now.astimezone(UTC) < event.ingested_at + PREDICTION_SETTLEMENT_GRACE
 
     async def _reject(self, message: Message, reason: DeadLetterReason) -> None:
         event = message.event

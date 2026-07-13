@@ -759,7 +759,6 @@ class ClickHouseRepository:
                     ) AS versioned
                 FROM {self._database}.predictions
                 WHERE target_time = {{target_time:DateTime64(3, 'UTC')}}
-                  AND generated_at <= {{target_time:DateTime64(3, 'UTC')}}
                 GROUP BY event_id
             )
             SELECT
@@ -778,6 +777,7 @@ class ClickHouseRepository:
                 tupleElement(versioned, 12) AS model_version,
                 tupleElement(versioned, 13) AS feature_schema_hash
             FROM canonical
+            WHERE tupleElement(versioned, 3) <= {{target_time:DateTime64(3, 'UTC')}}
             ORDER BY event_id
         """
         try:

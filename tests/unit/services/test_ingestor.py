@@ -181,6 +181,21 @@ async def test_poll_imbalance_publishes_every_delivery_with_one_deterministic_id
     assert client.calls[0][2] - client.calls[0][1] <= MAX_PAGE_RANGE
 
 
+@pytest.mark.asyncio
+async def test_poll_imbalance_gives_a_changed_source_payload_a_new_revision_identity() -> None:
+    original = fixture_records("ods161")[0]
+    corrected = {**original, "systemimbalance": 326.0}
+    client = FakeEliaClient({"ods161": [original, corrected, original]})
+    bus = InMemoryEventBus()
+
+    await make_ingestor(client, bus).poll_imbalance_once()
+
+    first, correction, repeated_original = [event for _, event in bus.published]
+    assert first.event_id != correction.event_id
+    assert first.event_id == repeated_original.event_id
+    assert correction.payload["system_imbalance_mw"] == 326.0
+
+
 @pytest.mark.parametrize(
     ("dataset", "method_name", "subject", "payload_field", "payload_value"),
     [

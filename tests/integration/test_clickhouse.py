@@ -344,6 +344,35 @@ async def test_prediction_revision_reads_a_single_tuple_when_latest_state_is_nul
 
 
 @pytest.mark.asyncio
+async def test_ineligible_prediction_revision_does_not_resurrect_an_older_revision() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    target = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    generated_at = target - timedelta(minutes=1) + timedelta(seconds=10)
+    try:
+        await repository.insert_event(
+            prediction_event(
+                event_id="prediction-ineligible-revision",
+                target_time=target,
+                generated_at=generated_at,
+            )
+        )
+        await repository.insert_event(
+            prediction_event(
+                event_id="prediction-ineligible-revision",
+                target_time=target,
+                generated_at=target + timedelta(seconds=1),
+            )
+        )
+
+        predictions = await repository.fetch_predictions_for_target(target)
+
+        assert predictions == []
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
 async def test_versioned_reads_survive_clickhouse_merges_and_preserve_knowledge_cutoffs() -> None:
     client = await migrated_client()
     repository = ClickHouseRepository(client, database=DATABASE)

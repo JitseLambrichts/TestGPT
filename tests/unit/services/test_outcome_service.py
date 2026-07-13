@@ -10,6 +10,7 @@ from imbalance_pipeline.services.outcomes import (
     MAX_PENDING_PREDICTION_DELIVERIES,
     OUTCOME_DLQ_SUBJECT,
     OUTCOME_SUBSCRIPTION,
+    PREDICTION_SETTLEMENT_GRACE,
     OutcomeService,
 )
 from imbalance_pipeline.storage.clickhouse import Prediction
@@ -190,6 +191,23 @@ async def test_outcome_service_naks_until_a_lagging_prediction_is_available() ->
     assert trace == [("nak", 5.0)]
     assert bus.published == []
     assert message.nak_delay == 5.0
+
+
+@pytest.mark.asyncio
+async def test_outcome_service_waits_for_the_prediction_settlement_grace_period() -> None:
+    trace: list[tuple[str, object]] = []
+    repository = FakeOutcomeRepository([prediction("first-member", "positive")])
+    bus = RecordingBus(trace)
+    now = NOW
+    service = OutcomeService(repository, bus, clock=lambda: now)
+
+    await service.handle(RecordingMessage(stored_event(), trace))
+    now = NOW + PREDICTION_SETTLEMENT_GRACE
+    await service.handle(RecordingMessage(stored_event(), trace, delivery_count=2))
+
+    assert trace[0] == ("nak", 5.0)
+    assert [subject for subject, _ in bus.published] == [Subject.OUTCOMES_IMBALANCE.value]
+    assert trace[-1] == ("ack", "stored-event-001")
 
 
 @pytest.mark.asyncio

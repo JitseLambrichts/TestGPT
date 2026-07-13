@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -293,7 +294,7 @@ class Ingestor:
             source=source,
             dataset=dataset,
             event_time=event_time,
-            natural_key=natural_key,
+            natural_key=_revisioned_natural_key(natural_key, payload),
             payload=payload,
             quality_status=quality_status,
             observed_at=observed_at,
@@ -391,6 +392,17 @@ def _timestamp_key(value: datetime) -> str:
 def _dimension_key(*, timestamp: datetime, **dimensions: str) -> str:
     identity = {"timestamp": _timestamp_key(timestamp), **dimensions}
     return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _revisioned_natural_key(natural_key: str, payload: BaseModel) -> str:
+    canonical_payload = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    revision = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    return f"{natural_key}:{revision}"
 
 
 def _normalize_boundary(value: datetime) -> datetime:
