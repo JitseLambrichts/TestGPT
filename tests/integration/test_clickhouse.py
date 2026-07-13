@@ -91,7 +91,7 @@ async def migrated_client() -> AsyncClient:
         await apply_migrations(admin, database=DATABASE)
         grants = await admin.query("SHOW GRANTS FOR imbalance")
         assert {str(row[0]) for row in grants.result_rows} == {
-            "GRANT SELECT, INSERT ON imbalance.* TO imbalance"
+            f"GRANT SELECT, INSERT ON {DATABASE}.* TO imbalance"
         }
         for table in ("raw_events", "imbalance_observations"):
             await admin.command(f"TRUNCATE TABLE {DATABASE}.{table}")
@@ -242,7 +242,7 @@ async def test_source_version_migration_is_safe_to_rerun() -> None:
     try:
         await repository.insert_event(source)
         await rerun_migrations()
-        created = await client.query("SHOW CREATE TABLE imbalance.imbalance_observations")
+        created = await client.query(f"SHOW CREATE TABLE {DATABASE}.imbalance_observations")
         observations = await repository.fetch_imbalance_window(
             source.event_time,
             minutes=5,

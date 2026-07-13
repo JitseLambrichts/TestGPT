@@ -98,7 +98,7 @@ async def apply_migrations(
                         f"migration {migration.version:03d}_{migration.name} checksum changed"
                     )
                 continue
-            await _execute_sql(client, migration.sql)
+            await _execute_sql(client, _render_sql(migration.sql, database))
             managed = MANAGED_MIGRATIONS.get(migration.version)
             if managed is not None:
                 await managed(client, database=database)
@@ -169,6 +169,10 @@ def _sql_statements(contents: str) -> Iterable[str]:
         ).strip()
         if statement:
             yield statement
+
+
+def _render_sql(template: str, database: str) -> str:
+    return template.replace("{{database}}", database)
 
 
 def _checksum_text(value: object) -> str:

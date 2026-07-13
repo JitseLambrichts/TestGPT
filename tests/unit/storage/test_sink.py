@@ -749,7 +749,7 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
         "prediction_outcomes",
         "model_versions",
     ):
-        assert f"CREATE TABLE IF NOT EXISTS imbalance.{table}" in schema
+        assert f"CREATE TABLE IF NOT EXISTS {{{{database}}}}.{table}" in schema
     assert schema.count("DateTime64(3, 'UTC')") >= 20
     assert schema.count("ReplacingMergeTree(row_version)") >= 7
     assert "migrate_source_version_retention" in version_retention
@@ -762,7 +762,7 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
     }
     assert schema.count("PARTITION BY toYYYYMM(") >= 8
     assert "TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE" in schema
-    assert "GRANT SELECT, INSERT ON imbalance.* TO imbalance" in schema
+    assert "GRANT SELECT, INSERT ON {{database}}.* TO imbalance" in schema
 
 
 @pytest.mark.asyncio

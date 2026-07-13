@@ -178,3 +178,28 @@ async def test_runner_rejects_a_second_concurrent_migration_process(tmp_path: Pa
         MANAGED_MIGRATIONS[2] = original
 
     assert client.migration_lock_held is False
+
+
+@pytest.mark.asyncio
+async def test_runner_renders_the_database_placeholder_after_identifier_validation(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "001_schema.sql").write_text(
+        "CREATE DATABASE IF NOT EXISTS {{database}};\n"
+        "CREATE TABLE IF NOT EXISTS {{database}}.schema_migrations (version UInt32);\n"
+    )
+    (tmp_path / "002_preserve_source_versions.sql").write_text("-- managed by Python\n")
+    client = FakeMigrationClient()
+    original = MANAGED_MIGRATIONS[2]
+
+    async def managed(_client: FakeMigrationClient, *, database: str) -> None:
+        del database
+
+    MANAGED_MIGRATIONS[2] = managed
+    try:
+        await apply_migrations(client, database="demo", directory=tmp_path)
+    finally:
+        MANAGED_MIGRATIONS[2] = original
+
+    assert "CREATE TABLE IF NOT EXISTS demo.schema_migrations (version UInt32)" in client.commands
+    assert all("{{database}}" not in command for command in client.commands)
