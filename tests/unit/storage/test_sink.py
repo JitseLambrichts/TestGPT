@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
@@ -14,6 +15,7 @@ from imbalance_pipeline.domain.events import EventEnvelope
 from imbalance_pipeline.messaging.base import Message
 from imbalance_pipeline.services.sink import (
     CLICKHOUSE_DLQ_SUBJECT,
+    DeadLetterPayload,
     Sink,
 )
 from imbalance_pipeline.storage.clickhouse import (
@@ -54,6 +56,150 @@ def imbalance_event() -> EventEnvelope:
     )
 
 
+def routed_events() -> list[tuple[str, dict[str, object], str | None]]:
+    timestamp = "2026-07-13T10:01:00Z"
+    return [
+        (
+            "elia.load.observed",
+            {
+                "timestamp": timestamp,
+                "resolution_code": "PT15M",
+                "measured_mw": 9_100.0,
+                "most_recent_forecast_mw": 9_050.0,
+                "most_recent_confidence_10_mw": 8_900.0,
+                "most_recent_confidence_90_mw": 9_200.0,
+                "day_ahead_forecast_mw": 9_000.0,
+                "day_ahead_confidence_10_mw": 8_800.0,
+                "day_ahead_confidence_90_mw": 9_250.0,
+                "week_ahead_forecast_mw": 8_950.0,
+            },
+            "load_observations",
+        ),
+        (
+            "elia.wind.observed",
+            {
+                "timestamp": timestamp,
+                "resolution_code": "PT15M",
+                "offshore_onshore": "Offshore",
+                "region": "Belgium",
+                "grid_connection_type": "Grid connected",
+                "real_time_mw": 1_500.0,
+                "most_recent_forecast_mw": 1_450.0,
+                "most_recent_confidence_10_mw": 1_300.0,
+                "most_recent_confidence_90_mw": 1_600.0,
+                "day_ahead_11h_forecast_mw": 1_400.0,
+                "day_ahead_11h_confidence_10_mw": 1_200.0,
+                "day_ahead_11h_confidence_90_mw": 1_650.0,
+                "day_ahead_forecast_mw": 1_420.0,
+                "day_ahead_confidence_10_mw": 1_250.0,
+                "day_ahead_confidence_90_mw": 1_620.0,
+                "week_ahead_forecast_mw": 1_350.0,
+                "week_ahead_confidence_10_mw": 1_100.0,
+                "week_ahead_confidence_90_mw": 1_700.0,
+                "monitored_capacity_mw": 2_300.0,
+                "load_factor": 0.65,
+                "decremental_bid_id": 42,
+            },
+            "wind_observations",
+        ),
+        (
+            "elia.solar.observed",
+            {
+                "timestamp": timestamp,
+                "resolution_code": "PT15M",
+                "region": "Belgium",
+                "real_time_mw": 2_100.0,
+                "most_recent_forecast_mw": 2_000.0,
+                "most_recent_confidence_10_mw": 1_800.0,
+                "most_recent_confidence_90_mw": 2_200.0,
+                "day_ahead_11h_forecast_mw": 1_950.0,
+                "day_ahead_11h_confidence_10_mw": 1_700.0,
+                "day_ahead_11h_confidence_90_mw": 2_250.0,
+                "day_ahead_forecast_mw": 1_980.0,
+                "day_ahead_confidence_10_mw": 1_750.0,
+                "day_ahead_confidence_90_mw": 2_230.0,
+                "week_ahead_forecast_mw": 1_900.0,
+                "week_ahead_confidence_10_mw": 1_600.0,
+                "week_ahead_confidence_90_mw": 2_300.0,
+                "load_factor": 0.42,
+                "monitored_capacity_mw": 5_000.0,
+            },
+            "solar_observations",
+        ),
+        (
+            "weather.forecast.observed",
+            {
+                "valid_time": timestamp,
+                "available_at": "2026-07-13T10:01:04Z",
+                "locations": ["Brussels"],
+                "variables": {},
+            },
+            None,
+        ),
+        (
+            "imbalance.feature.snapshot",
+            {
+                "cutoff": timestamp,
+                "target_time": "2026-07-13T10:02:00Z",
+                "feature_schema_hash": "feature-schema-001",
+                "local_values": [[1.0, 2.0]],
+                "local_masks": [[1, 1]],
+                "context_values": [[3.0]],
+                "context_masks": [[1]],
+                "static_values": [4.0],
+                "static_masks": [1],
+                "current_state": "positive",
+                "created_at": "2026-07-13T10:01:06Z",
+            },
+            "feature_snapshots",
+        ),
+        (
+            "imbalance.prediction.generated",
+            {
+                "cutoff": timestamp,
+                "target_time": "2026-07-13T10:02:00Z",
+                "generated_at": "2026-07-13T10:01:07Z",
+                "system_imbalance_mw": 120.0,
+                "p10_mw": 80.0,
+                "p90_mw": 160.0,
+                "flip_probability": 0.25,
+                "will_flip": False,
+                "current_state": "positive",
+                "predicted_state": "positive",
+                "prediction_quality": "model",
+                "model_version": "model-v1",
+                "feature_schema_hash": "feature-schema-001",
+            },
+            "predictions",
+        ),
+        (
+            "imbalance.prediction.evaluated",
+            {
+                "prediction_event_id": "prediction-event-001",
+                "target_time": "2026-07-13T10:02:00Z",
+                "realized_event_id": "realized-event-001",
+                "realized_system_imbalance_mw": -90.0,
+                "realized_state": "negative",
+                "flip_actual": True,
+                "evaluated_at": "2026-07-13T10:02:06Z",
+            },
+            "prediction_outcomes",
+        ),
+        (
+            "model.version.promoted",
+            {
+                "model_version": "model-v1",
+                "feature_schema_hash": "feature-schema-001",
+                "manifest_json": {"format": "onnx"},
+                "metrics_json": {"mae": 12.0},
+                "promoted_at": "2026-07-13T10:01:08Z",
+                "created_at": "2026-07-13T10:01:07Z",
+            },
+            "model_versions",
+        ),
+    ]
+
+
 class RecordingRepository:
     def __init__(
         self,
@@ -91,6 +237,30 @@ class RecordingBus:
             yield RecordingMessage(imbalance_event(), self.trace)
 
 
+class SequencedBus(RecordingBus):
+    def __init__(
+        self,
+        trace: list[tuple[str, object]],
+        messages: list["RecordingMessage"],
+    ) -> None:
+        super().__init__(trace)
+        self._messages = messages
+        self._publish_failures = 1
+
+    async def publish(self, subject: str, event: EventEnvelope) -> None:
+        self.trace.append(("publish", subject))
+        if self._publish_failures:
+            self._publish_failures -= 1
+            raise RuntimeError("broker unavailable")
+        self.published.append((subject, event))
+
+    async def messages(self, subject: str, durable: str) -> AsyncIterator[Message]:
+        del durable
+        if subject == "grid.raw.elia.imbalance.v1":
+            for message in self._messages:
+                yield message
+
+
 class RecordingMessage:
     def __init__(
         self,
@@ -98,19 +268,27 @@ class RecordingMessage:
         trace: list[tuple[str, object]],
         *,
         delivery_count: int = 1,
+        ack_failure: Exception | None = None,
+        nak_failure: Exception | None = None,
     ) -> None:
         self.event = event
         self.delivery_count = delivery_count
         self.trace = trace
         self.acked = False
         self.nak_delay: float | None = None
+        self.ack_failure = ack_failure
+        self.nak_failure = nak_failure
 
     async def ack(self) -> None:
         self.trace.append(("ack", self.event.event_id))
+        if self.ack_failure is not None:
+            raise self.ack_failure
         self.acked = True
 
     async def nak(self, delay_seconds: float) -> None:
         self.trace.append(("nak", delay_seconds))
+        if self.nak_failure is not None:
+            raise self.nak_failure
         self.nak_delay = delay_seconds
 
 
@@ -281,6 +459,59 @@ async def test_repository_validates_then_inserts_exact_raw_envelope_before_norma
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("event_type", "payload", "normalized_table"), routed_events())
+async def test_repository_routes_every_supported_event_type(
+    event_type: str,
+    payload: dict[str, object],
+    normalized_table: str | None,
+) -> None:
+    client = RecordingClickHouseClient()
+    source = imbalance_event().model_copy(
+        update={
+            "event_id": f"routed-{event_type}",
+            "event_type": event_type,
+            "payload": payload,
+        }
+    )
+
+    await repository_with(client).insert_event(source)
+
+    expected = ["imbalance.raw_events"]
+    if normalized_table is not None:
+        expected.append(f"imbalance.{normalized_table}")
+    assert [insert[0] for insert in client.inserts] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "payload_update"),
+    [
+        ("imbalance.feature.snapshot", {"local_masks": [[1]]}),
+        ("imbalance.prediction.generated", {"p10_mw": 200.0, "p90_mw": 100.0}),
+        ("model.version.promoted", {"manifest_json": "not-json"}),
+    ],
+)
+async def test_repository_rejects_invalid_future_payloads_before_raw_insert(
+    event_type: str,
+    payload_update: dict[str, object],
+) -> None:
+    client = RecordingClickHouseClient()
+    _, valid_payload, _ = next(item for item in routed_events() if item[0] == event_type)
+    source = imbalance_event().model_copy(
+        update={
+            "event_type": event_type,
+            "payload": {**valid_payload, **payload_update},
+        }
+    )
+
+    with pytest.raises(PermanentEventError) as raised:
+        await repository_with(client).insert_event(source)
+
+    assert raised.value.reason is DeadLetterReason.INVALID_PAYLOAD
+    assert client.inserts == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event", "reason"),
     [
@@ -357,17 +588,27 @@ async def test_fetch_imbalance_window_uses_atomic_latest_aggregation_without_fin
         )
     ]
     repository = repository_with(client)
-    cutoff = datetime(2026, 7, 13, 10, 1, tzinfo=UTC)
+    event_cutoff = datetime(2026, 7, 13, 10, 1, tzinfo=UTC)
+    knowledge_cutoff = datetime(2026, 7, 13, 10, 1, 5, tzinfo=UTC)
 
-    observations = await repository.fetch_imbalance_window(cutoff, 180)
+    observations = await repository.fetch_imbalance_window(
+        event_cutoff,
+        180,
+        knowledge_cutoff=knowledge_cutoff,
+    )
 
     assert len(observations) == 1
-    assert observations[0].timestamp == cutoff
+    assert observations[0].timestamp == event_cutoff
     assert observations[0].system_imbalance_mw == 325.224
     query, parameters, settings = client.queries[0]
     assert "argMax(tuple(" in query
     assert "FINAL" not in query.upper()
-    assert parameters == {"start": cutoff - timedelta(minutes=180), "cutoff": cutoff}
+    assert "ingested_at <= {knowledge_cutoff:DateTime64(3, 'UTC')}" in query
+    assert parameters == {
+        "start": event_cutoff - timedelta(minutes=180),
+        "event_cutoff": event_cutoff,
+        "knowledge_cutoff": knowledge_cutoff,
+    }
     assert settings["tz_mode"] == "aware"
 
 
@@ -377,9 +618,23 @@ async def test_fetch_imbalance_window_rejects_invalid_window_before_query() -> N
     repository = repository_with(client)
 
     with pytest.raises(ValueError, match="minutes must be positive"):
-        await repository.fetch_imbalance_window(datetime.now(UTC), 0)
+        await repository.fetch_imbalance_window(
+            datetime.now(UTC),
+            0,
+            knowledge_cutoff=datetime.now(UTC),
+        )
     with pytest.raises(ValueError, match="timezone-aware"):
-        await repository.fetch_imbalance_window(datetime(2026, 7, 13), 5)
+        await repository.fetch_imbalance_window(
+            datetime(2026, 7, 13),
+            5,
+            knowledge_cutoff=datetime.now(UTC),
+        )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await repository.fetch_imbalance_window(
+            datetime.now(UTC),
+            5,
+            knowledge_cutoff=datetime(2026, 7, 13),
+        )
 
     assert client.queries == []
 
@@ -478,8 +733,10 @@ async def test_fifth_transient_delivery_publishes_safe_dlq_then_acks() -> None:
         ("ack", "source-event-001"),
     ]
     dlq = bus.published[0][1]
-    assert dlq.payload["reason"] == DeadLetterReason.DELIVERY_EXHAUSTED
-    assert dlq.payload["delivery_count"] == 5
+    payload = DeadLetterPayload.model_validate(dlq.payload)
+    assert payload.reason is DeadLetterReason.DELIVERY_EXHAUSTED
+    assert payload.delivery_count == 5
+    assert payload.original_event == message.event
     assert secret not in dlq.model_dump_json()
     assert message.nak_delay is None
 
@@ -506,38 +763,36 @@ async def test_permanent_schema_error_publishes_typed_safe_dlq_before_ack() -> N
     assert dlq.event_type == "clickhouse.event.rejected"
     assert dlq.correlation_id == message.event.correlation_id
     assert dlq.causation_id == message.event.event_id
-    assert dlq.payload == {
-        "source_event_id": message.event.event_id,
-        "event_type": message.event.event_type,
-        "schema_version": message.event.schema_version,
-        "source": message.event.source,
-        "dataset": message.event.dataset,
-        "reason": DeadLetterReason.INVALID_PAYLOAD,
-        "delivery_count": 1,
-    }
+    payload = DeadLetterPayload.model_validate(dlq.payload)
+    assert payload.reason is DeadLetterReason.INVALID_PAYLOAD
+    assert payload.delivery_count == 1
+    assert payload.original_event == message.event
+    replay = DeadLetterPayload.model_validate_json(payload.model_dump_json()).original_event
+    assert replay == message.event
+    assert replay.model_dump_json() == message.event.model_dump_json()
     assert secret not in dlq.model_dump_json()
 
 
 @pytest.mark.asyncio
-async def test_publish_failure_leaves_inserted_source_unacked_for_safe_replay() -> None:
+async def test_stored_publish_failure_naks_inserted_source_for_safe_replay() -> None:
     trace: list[tuple[str, object]] = []
     repository = RecordingRepository(trace)
     bus = RecordingBus(trace, RuntimeError("broker unavailable"))
     message = RecordingMessage(imbalance_event(), trace)
 
-    with pytest.raises(RuntimeError, match="broker unavailable"):
-        await Sink(repository, bus).handle(message)
+    await Sink(repository, bus).handle(message)
 
     assert trace == [
         ("insert", "source-event-001"),
         ("publish", "grid.stored.elia.imbalance.v1"),
+        ("nak", 1.0),
     ]
     assert message.acked is False
-    assert message.nak_delay is None
+    assert message.nak_delay == 1.0
 
 
 @pytest.mark.asyncio
-async def test_dlq_publish_failure_does_not_ack_the_rejected_message() -> None:
+async def test_dlq_publish_failure_naks_the_rejected_message() -> None:
     trace: list[tuple[str, object]] = []
     repository = RecordingRepository(
         trace,
@@ -546,8 +801,85 @@ async def test_dlq_publish_failure_does_not_ack_the_rejected_message() -> None:
     bus = RecordingBus(trace, RuntimeError("broker unavailable"))
     message = RecordingMessage(imbalance_event(), trace)
 
-    with pytest.raises(RuntimeError, match="broker unavailable"):
-        await Sink(repository, bus).handle(message)
+    await Sink(repository, bus).handle(message)
 
     assert message.acked is False
-    assert message.nak_delay is None
+    assert message.nak_delay == 1.0
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_naks_the_source_message() -> None:
+    trace: list[tuple[str, object]] = []
+    repository = RecordingRepository(trace)
+    bus = RecordingBus(trace)
+    message = RecordingMessage(
+        imbalance_event(),
+        trace,
+        ack_failure=RuntimeError("ack unavailable"),
+    )
+
+    await Sink(repository, bus).handle(message)
+
+    assert trace == [
+        ("insert", "source-event-001"),
+        ("publish", "grid.stored.elia.imbalance.v1"),
+        ("ack", "source-event-001"),
+        ("nak", 1.0),
+    ]
+    assert message.acked is False
+    assert message.nak_delay == 1.0
+
+
+@pytest.mark.asyncio
+async def test_nak_failure_is_sanitized_and_does_not_ack() -> None:
+    trace: list[tuple[str, object]] = []
+    secret = "transport token=do-not-expose"
+    repository = RecordingRepository(trace)
+    bus = RecordingBus(trace, RuntimeError("broker unavailable"))
+    message = RecordingMessage(
+        imbalance_event(),
+        trace,
+        nak_failure=RuntimeError(secret),
+    )
+
+    with pytest.raises(RuntimeError, match="failed to request message redelivery") as raised:
+        await Sink(repository, bus).handle(message)
+
+    assert secret not in str(raised.value)
+    assert message.acked is False
+    assert trace[-1] == ("nak", 1.0)
+
+
+@pytest.mark.asyncio
+async def test_one_publish_and_settlement_failure_does_not_cancel_sibling_consumers() -> None:
+    trace: list[tuple[str, object]] = []
+    failed = RecordingMessage(
+        imbalance_event(),
+        trace,
+        nak_failure=RuntimeError("nak unavailable"),
+    )
+    succeeding_event = imbalance_event().model_copy(update={"event_id": "source-event-002"})
+    succeeded = RecordingMessage(succeeding_event, trace)
+    bus = SequencedBus(trace, [failed, succeeded])
+
+    await Sink(RecordingRepository(trace), bus).run()
+
+    assert failed.acked is False
+    assert succeeded.acked is True
+    assert len(bus.published) == 1
+    subject, stored_event = bus.published[0]
+    assert subject == "grid.stored.elia.imbalance.v1"
+    assert stored_event.causation_id == succeeding_event.event_id
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_publish_propagates_without_nak() -> None:
+    trace: list[tuple[str, object]] = []
+    repository = RecordingRepository(trace)
+    bus = RecordingBus(trace, asyncio.CancelledError())
+    message = RecordingMessage(imbalance_event(), trace)
+
+    with pytest.raises(asyncio.CancelledError):
+        await Sink(repository, bus).handle(message)
+
+    assert not any(call[0] == "nak" for call in trace)

@@ -38,13 +38,16 @@ class EventRepository(Protocol):
 class DeadLetterPayload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_event_id: str
-    event_type: str
-    schema_version: str
-    source: str
-    dataset: str
+    original_event: EventEnvelope
     reason: DeadLetterReason
     delivery_count: int
+
+
+class MessageSettlementError(RuntimeError):
+    """A safe, per-message failure after requesting broker settlement."""
+
+    def __init__(self) -> None:
+        super().__init__("failed to request message redelivery")
 
 
 class Sink:
@@ -54,18 +57,31 @@ class Sink:
 
     async def handle(self, message: Message) -> None:
         try:
+            should_retry = await self._process(message)
+        except Exception:
+            should_retry = True
+
+        if not should_retry:
+            return
+
+        try:
+            await message.nak(_delivery_delay(message.delivery_count))
+        except Exception:
+            raise MessageSettlementError from None
+
+    async def _process(self, message: Message) -> bool:
+        try:
             await self._repository.insert_event(message.event)
         except PermanentEventError as exc:
             await self._publish_dead_letter(message, exc.reason)
             await message.ack()
-            return
+            return False
         except TransientStorageError:
             if message.delivery_count >= MAX_DELIVERY_COUNT:
                 await self._publish_dead_letter(message, DeadLetterReason.DELIVERY_EXHAUSTED)
                 await message.ack()
-            else:
-                await message.nak(_delivery_delay(message.delivery_count))
-            return
+                return False
+            return True
 
         if message.event.event_type == "elia.imbalance.observed":
             await self._bus.publish(
@@ -73,6 +89,7 @@ class Sink:
                 _stored_event(message.event),
             )
         await message.ack()
+        return False
 
     async def run(self) -> None:
         async with asyncio.TaskGroup() as tasks:
@@ -81,7 +98,10 @@ class Sink:
 
     async def _consume(self, subject: str, durable: str) -> None:
         async for message in self._bus.messages(subject, durable):
-            await self.handle(message)
+            try:
+                await self.handle(message)
+            except MessageSettlementError:
+                continue
 
     async def _publish_dead_letter(
         self,
@@ -90,11 +110,7 @@ class Sink:
     ) -> None:
         source = message.event
         payload = DeadLetterPayload(
-            source_event_id=source.event_id,
-            event_type=source.event_type,
-            schema_version=source.schema_version,
-            source=source.source,
-            dataset=source.dataset,
+            original_event=source,
             reason=reason,
             delivery_count=message.delivery_count,
         )

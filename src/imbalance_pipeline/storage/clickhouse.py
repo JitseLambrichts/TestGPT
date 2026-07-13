@@ -466,13 +466,16 @@ class ClickHouseRepository:
 
     async def fetch_imbalance_window(
         self,
-        cutoff: datetime,
+        event_cutoff: datetime,
         minutes: int,
+        *,
+        knowledge_cutoff: datetime,
     ) -> list[ImbalanceObservation]:
         if minutes <= 0:
             raise ValueError("minutes must be positive")
-        cutoff_utc = _to_utc(cutoff)
-        start = cutoff_utc - timedelta(minutes=minutes)
+        event_cutoff_utc = _to_utc(event_cutoff)
+        knowledge_cutoff_utc = _to_utc(knowledge_cutoff)
+        start = event_cutoff_utc - timedelta(minutes=minutes)
         query = f"""
             SELECT
                 timestamp,
@@ -492,14 +495,19 @@ class ClickHouseRepository:
                 ) AS latest
             FROM {self._database}.imbalance_observations
             WHERE timestamp > {{start:DateTime64(3, 'UTC')}}
-              AND timestamp <= {{cutoff:DateTime64(3, 'UTC')}}
+              AND timestamp <= {{event_cutoff:DateTime64(3, 'UTC')}}
+              AND ingested_at <= {{knowledge_cutoff:DateTime64(3, 'UTC')}}
             GROUP BY timestamp
             ORDER BY timestamp
         """
         try:
             result = await self._client.query(
                 query,
-                parameters={"start": start, "cutoff": cutoff_utc},
+                parameters={
+                    "start": start,
+                    "event_cutoff": event_cutoff_utc,
+                    "knowledge_cutoff": knowledge_cutoff_utc,
+                },
                 tz_mode="aware",
             )
         except (ClickHouseError, OSError, TimeoutError) as exc:

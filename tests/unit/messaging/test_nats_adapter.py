@@ -111,7 +111,7 @@ def managed_consumer_config(
         durable_name=durable,
         deliver_policy=DeliverPolicy.ALL,
         ack_policy=AckPolicy.EXPLICIT,
-        max_deliver=5,
+        max_deliver=-1,
         backoff=[1, 5, 30, 120],
         filter_subject=subject,
         replay_policy=ReplayPolicy.INSTANT,
@@ -682,7 +682,7 @@ async def test_messages_configures_durable_pull_delivery_and_exposes_ack_metadat
     assert request.config.filter_subject == GRID_SUBJECT
     assert request.config.deliver_policy is DeliverPolicy.ALL
     assert request.config.ack_policy is AckPolicy.EXPLICIT
-    assert request.config.max_deliver == 5
+    assert request.config.max_deliver == -1
     assert request.config.backoff == [1, 5, 30, 120]
     assert request.config.replay_policy is ReplayPolicy.INSTANT
 
