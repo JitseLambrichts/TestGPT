@@ -1,7 +1,6 @@
 import json
 import os
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import clickhouse_connect
 import pytest
@@ -9,7 +8,7 @@ from clickhouse_connect.driver.asyncclient import AsyncClient
 
 from imbalance_pipeline.domain.events import EventEnvelope
 from imbalance_pipeline.storage.clickhouse import ClickHouseRepository
-from imbalance_pipeline.storage.migrations import migrate_source_version_retention
+from imbalance_pipeline.storage.migrate import apply_migrations
 
 CLICKHOUSE_URL = os.getenv("IMBALANCE_CLICKHOUSE_URL")
 CLICKHOUSE_USER = os.getenv("IMBALANCE_CLICKHOUSE_USER", "imbalance")
@@ -89,11 +88,7 @@ async def migrated_client() -> AsyncClient:
     )
     try:
         await admin.command(f"DROP DATABASE IF EXISTS {DATABASE} SYNC")
-        schema_path = Path(__file__).parents[2] / "infra" / "clickhouse" / "001_schema.sql"
-        for statement in (item.strip() for item in schema_path.read_text().split(";")):
-            if statement:
-                await admin.command(statement)
-        await migrate_source_version_retention(admin, database=DATABASE)
+        await apply_migrations(admin, database=DATABASE)
         grants = await admin.query("SHOW GRANTS FOR imbalance")
         assert {str(row[0]) for row in grants.result_rows} == {
             "GRANT SELECT, INSERT ON imbalance.* TO imbalance"
@@ -137,11 +132,7 @@ async def rerun_migrations() -> None:
         database="default",
     )
     try:
-        schema_path = Path(__file__).parents[2] / "infra" / "clickhouse" / "001_schema.sql"
-        for statement in (item.strip() for item in schema_path.read_text().split(";")):
-            if statement:
-                await admin.command(statement)
-        await migrate_source_version_retention(admin, database=DATABASE)
+        await apply_migrations(admin, database=DATABASE)
     finally:
         await admin.close()
 

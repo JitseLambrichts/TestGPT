@@ -202,10 +202,16 @@ async def test_build_many_reuses_online_transform_and_is_byte_identical() -> Non
     cutoffs = [CUTOFF - timedelta(minutes=offset) for offset in range(10)]
     source = MemoryFeatureSource(minute_rows(CUTOFF, 25 * 60, value=15.0))
     engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+    knowledge_cutoffs = [cutoff + timedelta(seconds=10) for cutoff in cutoffs]
+    replay = await engine.open_replay(
+        end=max(cutoffs),
+        knowledge_cutoff=max(knowledge_cutoffs),
+    )
 
     offline = await engine.build_many(
         cutoffs,
-        knowledge_cutoffs=[cutoff + timedelta(seconds=10) for cutoff in cutoffs],
+        knowledge_cutoffs=knowledge_cutoffs,
+        replay=replay,
     )
 
     for cutoff, expected in zip(cutoffs, offline, strict=True):
@@ -226,15 +232,32 @@ async def test_build_many_uses_one_ordered_version_replay() -> None:
     cutoffs = [CUTOFF - timedelta(minutes=offset) for offset in range(513)]
     source = MemoryFeatureSource(minute_rows(CUTOFF, 36 * 60, value=15.0))
     engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+    knowledge_cutoffs = [cutoff + timedelta(seconds=10) for cutoff in cutoffs]
+    replay = await engine.open_replay(
+        end=max(cutoffs),
+        knowledge_cutoff=max(knowledge_cutoffs),
+    )
 
     snapshots = await engine.build_many(
         cutoffs,
-        knowledge_cutoffs=[cutoff + timedelta(seconds=10) for cutoff in cutoffs],
+        knowledge_cutoffs=knowledge_cutoffs,
+        replay=replay,
     )
 
     assert [snapshot.cutoff for snapshot in snapshots] == cutoffs
     assert len(source.version_calls) == 1
     assert source.seed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_build_many_requires_a_reusable_replay_session() -> None:
+    source = MemoryFeatureSource(minute_rows(CUTOFF, 36 * 60, value=15.0))
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    with pytest.raises(ValueError, match="open_replay"):
+        await engine.build_many([CUTOFF], knowledge_cutoffs=[KNOWLEDGE_CUTOFF])
+
+    assert source.version_calls == []
 
 
 @pytest.mark.asyncio
@@ -273,10 +296,15 @@ async def test_build_many_replays_late_corrections_before_the_local_window() -> 
     )
     source = MemoryFeatureSource([original, correction])
     engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+    replay = await engine.open_replay(
+        end=CUTOFF,
+        knowledge_cutoff=CUTOFF + timedelta(seconds=10),
+    )
 
     before, after = await engine.build_many(
         [CUTOFF, CUTOFF],
         knowledge_cutoffs=[CUTOFF, CUTOFF + timedelta(seconds=10)],
+        replay=replay,
     )
     state_index = DEFAULT_FEATURE_REGISTRY.local_names.index("confirmed_state_sign")
 

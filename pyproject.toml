@@ -40,6 +40,7 @@ test = [
 [project.scripts]
 imbalance-ingestor = "imbalance_pipeline.services.ingestor:main"
 imbalance-sink = "imbalance_pipeline.services.sink:main"
+imbalance-migrate = "imbalance_pipeline.storage.migrate:main"
 imbalance-features = "imbalance_pipeline.services.features:main"
 imbalance-predictor = "imbalance_pipeline.services.predictor:main"
 imbalance-outcomes = "imbalance_pipeline.services.outcomes:main"

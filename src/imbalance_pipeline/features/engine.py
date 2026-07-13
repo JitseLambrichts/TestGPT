@@ -271,17 +271,16 @@ class FeatureEngine:
         event_cutoffs: Sequence[datetime],
         *,
         knowledge_cutoffs: Sequence[datetime],
+        replay: FeatureReplaySession | None = None,
     ) -> list[FeatureSnapshot]:
         if len(event_cutoffs) != len(knowledge_cutoffs):
             raise ValueError("event_cutoffs and knowledge_cutoffs must have equal lengths")
         if not event_cutoffs:
             return []
+        if replay is None:
+            raise ValueError("open_replay once and pass its session to every backfill batch")
         cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
         knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
-        replay = await self.open_replay(
-            end=max(cutoffs),
-            knowledge_cutoff=max(knowledge),
-        )
         requests = sorted(
             enumerate(zip(cutoffs, knowledge, strict=True)),
             key=lambda item: (item[1][1], item[1][0], item[0]),
