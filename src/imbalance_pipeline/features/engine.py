@@ -10,7 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from imbalance_pipeline.domain.events import event_id
-from imbalance_pipeline.domain.imbalance import ConfirmedState, ImbalanceObservation, advance_state
+from imbalance_pipeline.domain.imbalance import (
+    ConfirmedState,
+    ConfirmedStateSeed,
+    ImbalanceObservation,
+    VersionedImbalanceObservation,
+    advance_state,
+)
 from imbalance_pipeline.features.schema import DEFAULT_FEATURE_REGISTRY, FeatureRegistry
 
 LOCAL_HISTORY_MINUTES = 180
@@ -28,6 +34,29 @@ class FeatureSource(Protocol):
         *,
         knowledge_cutoff: datetime,
     ) -> list[ImbalanceObservation]: ...
+
+    async def fetch_imbalance_state_seed(
+        self,
+        before: datetime,
+        *,
+        knowledge_cutoff: datetime,
+        deadband_mw: float,
+    ) -> ConfirmedStateSeed: ...
+
+    async def fetch_imbalance_state_seeds(
+        self,
+        requests: Sequence[tuple[datetime, datetime]],
+        *,
+        deadband_mw: float,
+    ) -> list[ConfirmedStateSeed]: ...
+
+    async def fetch_imbalance_versions(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        knowledge_cutoff: datetime,
+    ) -> list[VersionedImbalanceObservation]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +106,12 @@ class FeatureEngine:
             required_minutes,
             knowledge_cutoff=knowledge,
         )
-        return self._transform(cutoff, knowledge, observations)
+        seed = await self._source.fetch_imbalance_state_seed(
+            _history_times(cutoff, self._registry)[0] - timedelta(minutes=1),
+            knowledge_cutoff=knowledge,
+            deadband_mw=self._registry.deadband_mw,
+        )
+        return self._transform(cutoff, knowledge, observations, seed)
 
     async def build_many(
         self,
@@ -87,20 +121,44 @@ class FeatureEngine:
     ) -> list[FeatureSnapshot]:
         if len(event_cutoffs) != len(knowledge_cutoffs):
             raise ValueError("event_cutoffs and knowledge_cutoffs must have equal lengths")
-        return [
-            await self.build(event_cutoff, knowledge_cutoff=knowledge_cutoff)
-            for event_cutoff, knowledge_cutoff in zip(
-                event_cutoffs,
-                knowledge_cutoffs,
-                strict=True,
+        if not event_cutoffs:
+            return []
+        cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
+        knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
+        starts = tuple(_history_times(cutoff, self._registry)[0] for cutoff in cutoffs)
+        versions = await self._source.fetch_imbalance_versions(
+            min(starts),
+            max(cutoffs),
+            knowledge_cutoff=max(knowledge),
+        )
+        seed_requests = tuple(
+            (history_start - timedelta(minutes=1), known_at)
+            for history_start, known_at in zip(starts, knowledge, strict=True)
+        )
+        seeds = await self._source.fetch_imbalance_state_seeds(
+            seed_requests,
+            deadband_mw=self._registry.deadband_mw,
+        )
+        if len(seeds) != len(cutoffs):
+            raise RuntimeError("feature source returned an unexpected number of state seeds")
+        snapshots: list[FeatureSnapshot] = []
+        for cutoff, known_at, seed in zip(cutoffs, knowledge, seeds, strict=True):
+            snapshots.append(
+                self._transform(
+                    cutoff,
+                    known_at,
+                    _canonical_observations(versions, cutoff, known_at),
+                    seed,
+                )
             )
-        ]
+        return snapshots
 
     def _transform(
         self,
         cutoff: datetime,
         knowledge_cutoff: datetime,
         observations: Sequence[ImbalanceObservation],
+        state_seed: ConfirmedStateSeed,
     ) -> FeatureSnapshot:
         history_times = _history_times(cutoff, self._registry)
         history_start = history_times[0]
@@ -113,6 +171,7 @@ class FeatureEngine:
             history_times,
             by_timestamp,
             self._registry.deadband_mw,
+            state_seed,
         )
         local_values, local_masks = self._local_window(
             history_times,
@@ -126,6 +185,7 @@ class FeatureEngine:
             history_times,
             balance,
             cutoff,
+            state_seed,
         )
         static_values = _static_values(cutoff)
         static_masks = np.ones(static_values.shape, dtype=np.uint8)
@@ -164,7 +224,12 @@ class FeatureEngine:
             static_values=static_values,
             static_masks=static_masks,
             current_state=current_state,
-            model_eligible=observed_minutes >= MIN_OBSERVED_MINUTES_FOR_MODEL,
+            model_eligible=bool(
+                observed_minutes >= MIN_OBSERVED_MINUTES_FOR_MODEL
+                and current_state is not None
+                and math.isfinite(ages[-1])
+                and ages[-1] <= _imbalance_max_age(self._registry)
+            ),
             observed_imbalance_minutes=observed_minutes,
             created_at=knowledge_cutoff,
         )
@@ -194,24 +259,25 @@ class FeatureEngine:
                     "boundary_distance_mw",
                     abs(abs(balance[history_index]) - self._registry.deadband_mw),
                 )
-                state = states[history_index]
-                if state is not None:
-                    sign = 1.0 if state is ConfirmedState.POSITIVE else -1.0
-                    self._set_local(values, masks, output_index, "confirmed_state_sign", sign)
-                    self._set_local(
-                        values,
-                        masks,
-                        output_index,
-                        "state_duration_minutes",
-                        durations[history_index],
-                    )
-            self._set_local(
-                values,
-                masks,
-                output_index,
-                "imbalance_age_minutes",
-                ages[history_index],
-            )
+            state = states[history_index]
+            if state is not None:
+                sign = 1.0 if state is ConfirmedState.POSITIVE else -1.0
+                self._set_local(values, masks, output_index, "confirmed_state_sign", sign)
+                self._set_local(
+                    values,
+                    masks,
+                    output_index,
+                    "state_duration_minutes",
+                    durations[history_index],
+                )
+            if math.isfinite(ages[history_index]):
+                self._set_local(
+                    values,
+                    masks,
+                    output_index,
+                    "imbalance_age_minutes",
+                    ages[history_index],
+                )
         return values, masks
 
     def _set_local_raw(
@@ -285,7 +351,7 @@ class FeatureEngine:
                 "delta_2_mw",
                 current - balance[history_index - 2],
             )
-        for window in (5, 15, 60):
+        for window in self._registry.ewm_windows:
             sample = _complete_window(balance, history_index, window)
             if sample is not None:
                 self._set_local(
@@ -295,7 +361,7 @@ class FeatureEngine:
                     f"ewm_{window}_mw",
                     _ewm(sample),
                 )
-        for window in (5, 15):
+        for window in self._registry.median_windows:
             sample = _complete_window(balance, history_index, window)
             if sample is not None:
                 self._set_local(
@@ -305,14 +371,7 @@ class FeatureEngine:
                     f"rolling_median_{window}_mw",
                     float(np.median(sample)),
                 )
-                self._set_local(
-                    values,
-                    masks,
-                    output_index,
-                    f"slope_{window}_mw_per_minute",
-                    _slope(sample),
-                )
-                if window == 15:
+                if window == max(self._registry.median_windows):
                     self._set_local(
                         values,
                         masks,
@@ -327,7 +386,17 @@ class FeatureEngine:
                         "rolling_max_15_mw",
                         float(np.max(sample)),
                     )
-        for window in (15, 60):
+        for window in self._registry.slope_windows:
+            sample = _complete_window(balance, history_index, window)
+            if sample is not None:
+                self._set_local(
+                    values,
+                    masks,
+                    output_index,
+                    f"slope_{window}_mw_per_minute",
+                    _slope(sample),
+                )
+        for window in self._registry.robust_scale_windows:
             sample = _complete_window(balance, history_index, window)
             if sample is not None:
                 median = float(np.median(sample))
@@ -368,6 +437,7 @@ class FeatureEngine:
         history_times: Sequence[datetime],
         balance: NDArray[np.float64],
         cutoff: datetime,
+        state_seed: ConfirmedStateSeed,
     ) -> tuple[NDArray[np.float32], NDArray[np.uint8]]:
         values = np.zeros(
             (self._registry.context_steps, len(self._registry.context_names)),
@@ -395,16 +465,19 @@ class FeatureEngine:
                 self._set_context(values, masks, row, "imbalance_min_mw", float(np.min(array)))
                 self._set_context(values, masks, row, "imbalance_max_mw", float(np.max(array)))
                 self._set_context(values, masks, row, "imbalance_std_mw", float(np.std(array)))
-                self._set_context(values, masks, row, "imbalance_age_minutes", 0.0)
-            else:
-                self._set_context(values, masks, row, "imbalance_age_minutes", float(row * 15))
-            for source_name in ("load", "wind", "solar"):
+            last_observed_at = _last_observed_at(
+                history_times,
+                balance,
+                bin_end,
+                state_seed.last_observed_at,
+            )
+            if last_observed_at is not None:
                 self._set_context(
                     values,
                     masks,
                     row,
-                    f"{source_name}_actual_age_minutes",
-                    float(row * self._registry.context_resolution_minutes),
+                    "imbalance_age_minutes",
+                    _minutes_between(last_observed_at, bin_end),
                 )
         return values, masks
 
@@ -425,6 +498,7 @@ def _balance_history(
     times: Sequence[datetime],
     observations: dict[datetime, ImbalanceObservation],
     deadband_mw: float,
+    state_seed: ConfirmedStateSeed,
 ) -> tuple[
     NDArray[np.float64],
     list[ConfirmedState | None],
@@ -434,27 +508,30 @@ def _balance_history(
     values = np.full(len(times), np.nan, dtype=np.float64)
     states: list[ConfirmedState | None] = []
     durations = np.zeros(len(times), dtype=np.float64)
-    ages = np.zeros(len(times), dtype=np.float64)
-    previous_state: ConfirmedState | None = None
-    duration = 0
-    age = 0
+    ages = np.full(len(times), np.nan, dtype=np.float64)
+    previous_state = state_seed.state
+    state_since = state_seed.state_since
+    last_observed_at = state_seed.last_observed_at
     for index, timestamp in enumerate(times):
         observation = observations.get(timestamp)
         if observation is None:
-            age += 1
             states.append(previous_state)
-            durations[index] = duration
-            ages[index] = age
+            if previous_state is not None and state_since is not None:
+                durations[index] = _minutes_between(state_since, timestamp)
+            if last_observed_at is not None:
+                ages[index] = _minutes_between(last_observed_at, timestamp)
             continue
         value = observation.system_imbalance_mw
         values[index] = value
-        age = 0
         next_state = advance_state(previous_state, value, deadband_mw)
-        duration = duration + 1 if next_state is previous_state else 1
+        if next_state is not previous_state:
+            state_since = timestamp
         previous_state = next_state
+        last_observed_at = timestamp
         states.append(next_state)
-        durations[index] = duration
-        ages[index] = age
+        if next_state is not None and state_since is not None:
+            durations[index] = _minutes_between(state_since, timestamp)
+        ages[index] = 0.0
     return values, states, durations, ages
 
 
@@ -497,8 +574,8 @@ def _static_values(cutoff: datetime) -> NDArray[np.float32]:
     weekday = local.weekday()
     day_of_year = local.timetuple().tm_yday - 1
     holiday_calendar = holidays.country_holidays("BE", years=[local.year])
-    dst_before = (local - timedelta(hours=1)).utcoffset()
-    dst_after = (local + timedelta(hours=1)).utcoffset()
+    dst_before = (cutoff - timedelta(hours=1)).astimezone(BRUSSELS).utcoffset()
+    dst_after = (cutoff + timedelta(hours=1)).astimezone(BRUSSELS).utcoffset()
     return np.asarray(
         (
             math.sin(2.0 * math.pi * minute_of_quarter / 15.0),
@@ -535,6 +612,58 @@ def _history_times(cutoff: datetime, registry: FeatureRegistry) -> tuple[datetim
 def _minute_range(start: datetime, end: datetime) -> tuple[datetime, ...]:
     count = int((end - start).total_seconds() // 60) + 1
     return tuple(start + timedelta(minutes=offset) for offset in range(count))
+
+
+def _canonical_observations(
+    versions: Sequence[VersionedImbalanceObservation],
+    cutoff: datetime,
+    knowledge_cutoff: datetime,
+) -> list[ImbalanceObservation]:
+    canonical: dict[datetime, VersionedImbalanceObservation] = {}
+    for version in sorted(
+        versions,
+        key=lambda item: (
+            item.observation.timestamp,
+            item.row_version,
+            item.available_at,
+            item.event_id,
+        ),
+    ):
+        timestamp = _utc(version.observation.timestamp)
+        if timestamp <= cutoff and version.available_at <= knowledge_cutoff:
+            canonical[timestamp] = version
+    return [canonical[timestamp].observation for timestamp in sorted(canonical)]
+
+
+def _last_observed_at(
+    history_times: Sequence[datetime],
+    balance: NDArray[np.float64],
+    at: datetime,
+    seed_last_observed_at: datetime | None,
+) -> datetime | None:
+    observed = [
+        timestamp
+        for timestamp, value in zip(history_times, balance, strict=True)
+        if timestamp <= at and math.isfinite(value)
+    ]
+    if observed:
+        return observed[-1]
+    return seed_last_observed_at
+
+
+def _minutes_between(start: datetime, end: datetime) -> float:
+    return (end - start).total_seconds() / 60.0
+
+
+def _imbalance_max_age(registry: FeatureRegistry) -> int:
+    definition = next(
+        feature
+        for feature in registry.features
+        if feature.group == "local" and feature.name == "imbalance_age_minutes"
+    )
+    if definition.max_source_age_minutes is None:
+        raise RuntimeError("imbalance_age_minutes requires a maximum source age")
+    return definition.max_source_age_minutes
 
 
 def _utc(value: datetime) -> datetime:

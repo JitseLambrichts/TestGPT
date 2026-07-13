@@ -22,14 +22,31 @@ class FeatureRegistry:
     local_window_minutes: int = 180
     context_steps: int = 96
     context_resolution_minutes: int = 15
+    source_profile: str = "imbalance-only-v1"
+    transform_version: str = "causal-v1"
+    ewm_windows: tuple[int, ...] = (5, 15, 60)
+    median_windows: tuple[int, ...] = (5, 15)
+    robust_scale_windows: tuple[int, ...] = (15, 60)
+    slope_windows: tuple[int, ...] = (5, 15)
+    missingness_policy: str = "zero-mask-causal-age-v1"
+    context_aggregation: str = "right-closed-15-minute-v1"
+    calendar_timezone: str = "Europe/Brussels"
 
     def __post_init__(self) -> None:
         if self.deadband_mw <= 0:
             raise ValueError("deadband_mw must be positive")
-        if self.local_window_minutes <= 0:
-            raise ValueError("local_window_minutes must be positive")
-        if self.context_steps <= 0 or self.context_resolution_minutes <= 0:
-            raise ValueError("context window dimensions must be positive")
+        if (
+            self.local_window_minutes,
+            self.context_steps,
+            self.context_resolution_minutes,
+        ) != (180, 96, 15):
+            raise ValueError("fixed feature contract requires 180 local minutes and 96x15 context")
+        if not self.source_profile:
+            raise ValueError("source_profile cannot be empty")
+        if not self.transform_version:
+            raise ValueError("transform_version cannot be empty")
+        if not all(window > 0 for window in self.ewm_windows + self.median_windows):
+            raise ValueError("transform windows must be positive")
         for group in ("local", "context", "static"):
             names = tuple(feature.name for feature in self.features if feature.group == group)
             if len(names) != len(set(names)):
@@ -54,7 +71,10 @@ class FeatureRegistry:
         canonical = {
             "context_resolution_minutes": self.context_resolution_minutes,
             "context_steps": self.context_steps,
+            "context_aggregation": self.context_aggregation,
+            "calendar_timezone": self.calendar_timezone,
             "deadband_mw": self.deadband_mw,
+            "ewm_windows": self.ewm_windows,
             "features": [
                 {
                     "dtype": feature.dtype,
@@ -66,6 +86,12 @@ class FeatureRegistry:
                 for feature in self.features
             ],
             "local_window_minutes": self.local_window_minutes,
+            "median_windows": self.median_windows,
+            "missingness_policy": self.missingness_policy,
+            "robust_scale_windows": self.robust_scale_windows,
+            "slope_windows": self.slope_windows,
+            "source_profile": self.source_profile,
+            "transform_version": self.transform_version,
         }
         encoded = json.dumps(
             canonical,
@@ -76,8 +102,19 @@ class FeatureRegistry:
         return hashlib.sha256(encoded).hexdigest()
 
     @classmethod
-    def default(cls, *, deadband_mw: float = 10.0) -> "FeatureRegistry":
-        return cls(features=_default_features(), deadband_mw=deadband_mw)
+    def default(
+        cls,
+        *,
+        deadband_mw: float = 10.0,
+        source_profile: str = "imbalance-only-v1",
+        transform_version: str = "causal-v1",
+    ) -> "FeatureRegistry":
+        return cls(
+            features=_default_features(),
+            deadband_mw=deadband_mw,
+            source_profile=source_profile,
+            transform_version=transform_version,
+        )
 
 
 def _feature(

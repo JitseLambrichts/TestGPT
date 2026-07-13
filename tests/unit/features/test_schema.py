@@ -1,3 +1,5 @@
+import pytest
+
 from imbalance_pipeline.features.schema import DEFAULT_FEATURE_REGISTRY, FeatureRegistry
 
 
@@ -32,9 +34,26 @@ def test_registry_fingerprint_changes_with_hysteresis_or_ordered_schema() -> Non
     baseline = FeatureRegistry.default()
 
     assert FeatureRegistry.default(deadband_mw=12.0).fingerprint != baseline.fingerprint
+    assert (
+        FeatureRegistry.default(source_profile="imbalance-load-wind-solar-v1").fingerprint
+        != baseline.fingerprint
+    )
+    assert (
+        FeatureRegistry.default(transform_version="causal-v2").fingerprint != baseline.fingerprint
+    )
     assert baseline.local_names != tuple(reversed(baseline.local_names))
     assert {feature.group for feature in baseline.features} == {
         "local",
         "context",
         "static",
     }
+
+
+def test_registry_rejects_dimensions_the_feature_engine_cannot_preserve() -> None:
+    baseline = FeatureRegistry.default()
+
+    with pytest.raises(ValueError, match="fixed feature contract"):
+        FeatureRegistry(
+            features=baseline.features,
+            local_window_minutes=181,
+        )

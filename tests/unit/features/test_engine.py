@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from conftest import MemoryFeatureSource, VersionedObservation, minute_rows, observation
 
-from imbalance_pipeline.domain.imbalance import ConfirmedState
+from imbalance_pipeline.domain.imbalance import ConfirmedState, ConfirmedStateSeed
 from imbalance_pipeline.features.engine import FeatureEngine
 from imbalance_pipeline.features.schema import DEFAULT_FEATURE_REGISTRY
 
@@ -57,6 +57,62 @@ async def test_hysteresis_keeps_neutral_state_until_a_boundary_is_crossed() -> N
 
 
 @pytest.mark.asyncio
+async def test_seeded_state_persists_through_a_neutral_history_and_counts_elapsed_minutes() -> None:
+    rows = [
+        VersionedObservation(
+            observation(CUTOFF - timedelta(minutes=index), 0.0),
+            CUTOFF - timedelta(minutes=index) + timedelta(seconds=2),
+        )
+        for index in range(180)
+    ]
+    seed = ConfirmedStateSeed(
+        ConfirmedState.POSITIVE,
+        CUTOFF - timedelta(minutes=2_000),
+        CUTOFF - timedelta(minutes=1_447),
+    )
+    source = MemoryFeatureSource(rows, state_seed=seed)
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(CUTOFF, knowledge_cutoff=KNOWLEDGE_CUTOFF)
+    sign_index = DEFAULT_FEATURE_REGISTRY.local_names.index("confirmed_state_sign")
+    duration_index = DEFAULT_FEATURE_REGISTRY.local_names.index("state_duration_minutes")
+
+    assert snapshot.current_state is ConfirmedState.POSITIVE
+    assert snapshot.local_values[-1, sign_index] == 1.0
+    assert snapshot.local_masks[-1, sign_index] == 1
+    assert snapshot.local_values[-1, duration_index] == 2_000.0
+    assert snapshot.local_masks[-1, duration_index] == 1
+
+
+@pytest.mark.asyncio
+async def test_state_features_remain_visible_when_the_current_minute_is_missing() -> None:
+    first = CUTOFF - timedelta(minutes=179)
+    rows = [
+        VersionedObservation(
+            observation(first + timedelta(minutes=index), 0.0),
+            first + timedelta(minutes=index, seconds=2),
+        )
+        for index in range(179)
+    ]
+    seed = ConfirmedStateSeed(
+        ConfirmedState.NEGATIVE,
+        CUTOFF - timedelta(minutes=2_000),
+        CUTOFF - timedelta(minutes=1_447),
+    )
+    source = MemoryFeatureSource(rows, state_seed=seed)
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(CUTOFF, knowledge_cutoff=KNOWLEDGE_CUTOFF)
+    sign_index = DEFAULT_FEATURE_REGISTRY.local_names.index("confirmed_state_sign")
+    duration_index = DEFAULT_FEATURE_REGISTRY.local_names.index("state_duration_minutes")
+
+    assert snapshot.local_values[-1, sign_index] == -1.0
+    assert snapshot.local_masks[-1, sign_index] == 1
+    assert snapshot.local_values[-1, duration_index] == 2_000.0
+    assert snapshot.local_masks[-1, duration_index] == 1
+
+
+@pytest.mark.asyncio
 async def test_missing_history_is_zero_masked_and_forces_fallback_eligibility() -> None:
     rows = minute_rows(CUTOFF, 20, value=-25.0)
     source = MemoryFeatureSource(rows)
@@ -73,7 +129,49 @@ async def test_missing_history_is_zero_masked_and_forces_fallback_eligibility() 
     assert np.all(snapshot.local_masks[:160, imbalance_index] == 0)
     assert np.all(snapshot.context_values[:, load_index] == 0.0)
     assert np.all(snapshot.context_masks[:, load_index] == 0)
-    assert np.all(np.diff(snapshot.context_values[:, load_age_index]) >= 0.0)
+    assert np.all(snapshot.context_values[:, load_age_index] == 0.0)
+    assert np.all(snapshot.context_masks[:, load_age_index] == 0)
+
+
+@pytest.mark.asyncio
+async def test_model_eligibility_rejects_a_stale_last_observation() -> None:
+    source = MemoryFeatureSource(
+        minute_rows(CUTOFF - timedelta(minutes=150), 30, value=25.0),
+        state_seed=ConfirmedStateSeed(
+            ConfirmedState.POSITIVE,
+            CUTOFF - timedelta(minutes=2_000),
+            CUTOFF - timedelta(minutes=1_447),
+        ),
+    )
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(CUTOFF, knowledge_cutoff=KNOWLEDGE_CUTOFF)
+
+    assert snapshot.observed_imbalance_minutes >= 30
+    assert snapshot.current_state is ConfirmedState.POSITIVE
+    assert snapshot.model_eligible is False
+
+
+@pytest.mark.asyncio
+async def test_context_age_tracks_the_last_causal_observation_across_empty_bins() -> None:
+    first_context_timestamp = CUTOFF - timedelta(minutes=24 * 60 + 6)
+    source = MemoryFeatureSource(
+        [
+            VersionedObservation(
+                observation(first_context_timestamp, 25.0),
+                first_context_timestamp + timedelta(seconds=2),
+            )
+        ]
+    )
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(CUTOFF, knowledge_cutoff=KNOWLEDGE_CUTOFF)
+    age_index = DEFAULT_FEATURE_REGISTRY.context_names.index("imbalance_age_minutes")
+
+    assert snapshot.context_values[0, age_index] == 14.0
+    assert snapshot.context_masks[0, age_index] == 1
+    assert snapshot.context_values[1, age_index] == 29.0
+    assert snapshot.context_masks[1, age_index] == 1
 
 
 @pytest.mark.asyncio
@@ -118,3 +216,25 @@ async def test_build_many_reuses_online_transform_and_is_byte_identical() -> Non
         np.testing.assert_array_equal(online.context_masks, expected.context_masks)
         np.testing.assert_array_equal(online.static_values, expected.static_values)
         assert online.feature_schema_hash == expected.feature_schema_hash
+    assert len(source.version_calls) == 1
+    assert len(source.seed_batch_calls) == 1
+    assert len(source.seed_calls) == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        datetime(2026, 3, 29, 0, 30, tzinfo=UTC),
+        datetime(2026, 10, 25, 0, 30, tzinfo=UTC),
+    ],
+)
+async def test_static_features_mark_both_brussels_dst_transitions(cutoff: datetime) -> None:
+    source = MemoryFeatureSource([])
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(cutoff, knowledge_cutoff=cutoff + timedelta(seconds=1))
+    transition_index = DEFAULT_FEATURE_REGISTRY.static_names.index("is_dst_transition")
+
+    assert snapshot.static_values[transition_index] == 1.0
+    assert snapshot.static_masks[transition_index] == 1

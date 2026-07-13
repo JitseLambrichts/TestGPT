@@ -1,13 +1,12 @@
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from imbalance_pipeline.domain.imbalance import ImbalanceObservation
+from imbalance_pipeline.domain.imbalance import (
+    ConfirmedStateSeed,
+    ImbalanceObservation,
+    VersionedImbalanceObservation,
+)
 
-
-@dataclass(frozen=True, slots=True)
-class VersionedObservation:
-    observation: ImbalanceObservation
-    available_at: datetime
+VersionedObservation = VersionedImbalanceObservation
 
 
 def observation(
@@ -35,9 +34,18 @@ def observation(
 
 
 class MemoryFeatureSource:
-    def __init__(self, rows: list[VersionedObservation]) -> None:
+    def __init__(
+        self,
+        rows: list[VersionedObservation],
+        *,
+        state_seed: ConfirmedStateSeed | None = None,
+    ) -> None:
         self.rows = rows
+        self.state_seed = state_seed or ConfirmedStateSeed(None, None, None)
         self.calls: list[tuple[datetime, int, datetime]] = []
+        self.seed_calls: list[tuple[datetime, datetime]] = []
+        self.seed_batch_calls: list[tuple[tuple[datetime, datetime], ...]] = []
+        self.version_calls: list[tuple[datetime, datetime, datetime]] = []
 
     async def fetch_imbalance_window(
         self,
@@ -52,6 +60,42 @@ class MemoryFeatureSource:
             row.observation
             for row in self.rows
             if start < row.observation.timestamp <= event_cutoff
+            and row.available_at <= knowledge_cutoff
+        ]
+
+    async def fetch_imbalance_state_seed(
+        self,
+        before: datetime,
+        *,
+        knowledge_cutoff: datetime,
+        deadband_mw: float,
+    ) -> ConfirmedStateSeed:
+        del deadband_mw
+        self.seed_calls.append((before, knowledge_cutoff))
+        return self.state_seed
+
+    async def fetch_imbalance_state_seeds(
+        self,
+        requests: tuple[tuple[datetime, datetime], ...],
+        *,
+        deadband_mw: float,
+    ) -> list[ConfirmedStateSeed]:
+        del deadband_mw
+        self.seed_batch_calls.append(requests)
+        return [self.state_seed for _ in requests]
+
+    async def fetch_imbalance_versions(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        knowledge_cutoff: datetime,
+    ) -> list[VersionedObservation]:
+        self.version_calls.append((start, end, knowledge_cutoff))
+        return [
+            row
+            for row in self.rows
+            if start <= row.observation.timestamp <= end
             and row.available_at <= knowledge_cutoff
         ]
 

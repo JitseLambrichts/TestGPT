@@ -39,6 +39,7 @@ def event(
     *,
     event_id: str = "integration-event-001",
     ingested_at: datetime = datetime(2026, 7, 13, 10, 1, 5, tzinfo=UTC),
+    event_time: datetime = datetime(2026, 7, 13, 10, 1, tzinfo=UTC),
     value: float = 325.224,
 ) -> EventEnvelope:
     return EventEnvelope(
@@ -47,15 +48,21 @@ def event(
         schema_version="1",
         source="elia",
         dataset="ods161",
-        event_time=datetime(2026, 7, 13, 10, 1, tzinfo=UTC),
-        observed_at=datetime(2026, 7, 13, 10, 1, 4, tzinfo=UTC),
+        event_time=event_time,
+        observed_at=event_time + timedelta(seconds=4),
         ingested_at=ingested_at,
         correlation_id="integration-correlation",
         causation_id="integration-source-request",
         quality_status="Validated",
         payload={
-            "timestamp": "2026-07-13T10:01:00Z",
-            "quarter_hour": "2026-07-13T10:00:00Z",
+            "timestamp": event_time.isoformat().replace("+00:00", "Z"),
+            "quarter_hour": event_time.replace(
+                minute=(event_time.minute // 15) * 15,
+                second=0,
+                microsecond=0,
+            )
+            .isoformat()
+            .replace("+00:00", "Z"),
             "resolution_code": "PT1M",
             "quality_status": "Validated",
             "ace_mw": -12.5,
@@ -99,6 +106,22 @@ async def migrated_client() -> AsyncClient:
         password=CLICKHOUSE_PASSWORD,
         database=DATABASE,
     )
+
+
+async def optimize_table(table: str) -> None:
+    assert CLICKHOUSE_URL is not None
+    assert CLICKHOUSE_ADMIN_USER is not None
+    assert CLICKHOUSE_ADMIN_PASSWORD is not None
+    admin = await clickhouse_connect.get_async_client(
+        dsn=CLICKHOUSE_URL,
+        username=CLICKHOUSE_ADMIN_USER,
+        password=CLICKHOUSE_ADMIN_PASSWORD,
+        database=DATABASE,
+    )
+    try:
+        await admin.command(f"OPTIMIZE TABLE {DATABASE}.{table} FINAL")
+    finally:
+        await admin.close()
 
 
 @pytest.mark.asyncio
@@ -163,5 +186,40 @@ async def test_point_in_time_query_excludes_a_late_correction_until_it_was_known
         assert len(after_correction) == 1
         assert after_correction[0].timestamp == newer.event_time
         assert after_correction[0].system_imbalance_mw == -250.0
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_versioned_reads_survive_clickhouse_merges_and_preserve_knowledge_cutoffs() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    original = event(event_id="history-key", value=100.0)
+    correction = event(
+        event_id="history-key",
+        ingested_at=original.ingested_at + timedelta(seconds=1),
+        value=-250.0,
+    )
+    try:
+        await repository.insert_event(original)
+        await repository.insert_event(correction)
+        await optimize_table("imbalance_observations")
+
+        versions = await repository.fetch_imbalance_versions(
+            original.event_time,
+            original.event_time,
+            knowledge_cutoff=correction.ingested_at,
+        )
+        before, after = await repository.fetch_imbalance_state_seeds(
+            (
+                (original.event_time, original.ingested_at),
+                (correction.event_time, correction.ingested_at),
+            ),
+            deadband_mw=10.0,
+        )
+
+        assert [row.observation.system_imbalance_mw for row in versions] == [100.0, -250.0]
+        assert before.state is not None and before.state.value == "positive"
+        assert after.state is not None and after.state.value == "negative"
     finally:
         await repository.aclose()

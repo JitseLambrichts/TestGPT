@@ -12,6 +12,7 @@ from clickhouse_connect.driver.asyncclient import AsyncClient
 from clickhouse_connect.driver.exceptions import OperationalError
 
 from imbalance_pipeline.domain.events import EventEnvelope
+from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.messaging.base import Message
 from imbalance_pipeline.services.sink import (
     CLICKHOUSE_DLQ_SUBJECT,
@@ -639,6 +640,104 @@ async def test_fetch_imbalance_window_rejects_invalid_window_before_query() -> N
     assert client.queries == []
 
 
+@pytest.mark.asyncio
+async def test_fetch_imbalance_versions_keeps_all_known_corrections_for_pit_reads() -> None:
+    client = RecordingClickHouseClient()
+    timestamp = datetime(2026, 7, 13, 10, 1)
+    client.query_rows = [
+        (
+            "original",
+            timestamp,
+            datetime(2026, 7, 13, 10, 0),
+            "PT1M",
+            "Validated",
+            -12.5,
+            325.224,
+            None,
+            None,
+            120.13,
+            99.97,
+            99.97,
+            datetime(2026, 7, 13, 10, 1, 5),
+            1,
+        ),
+        (
+            "correction",
+            timestamp,
+            datetime(2026, 7, 13, 10, 0),
+            "PT1M",
+            "Validated",
+            -11.0,
+            300.0,
+            None,
+            None,
+            120.13,
+            99.97,
+            99.97,
+            datetime(2026, 7, 13, 10, 1, 7),
+            2,
+        ),
+    ]
+    repository = repository_with(client)
+    start = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    end = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    known_at = datetime(2026, 7, 13, 10, 1, 10, tzinfo=UTC)
+
+    versions = await repository.fetch_imbalance_versions(
+        start,
+        end,
+        knowledge_cutoff=known_at,
+    )
+
+    assert [row.event_id for row in versions] == ["original", "correction"]
+    assert [row.row_version for row in versions] == [1, 2]
+    query, parameters, settings = client.queries[0]
+    assert "FINAL" not in query.upper()
+    assert "row_version" in query
+    assert "ingested_at <= {knowledge_cutoff:DateTime64(3, 'UTC')}" in query
+    assert parameters == {"start": start, "end": end, "knowledge_cutoff": known_at}
+    assert settings["tz_mode"] == "aware"
+
+
+@pytest.mark.asyncio
+async def test_fetch_imbalance_state_seeds_batches_independent_point_in_time_states() -> None:
+    client = RecordingClickHouseClient()
+    client.query_rows = [
+        (
+            0,
+            25.0,
+            datetime(2026, 7, 13, 9, 1),
+            datetime(2026, 7, 13, 10, 0),
+        ),
+        (1, None, None, None),
+    ]
+    repository = repository_with(client)
+    first_before = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    second_before = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
+    known_at = datetime(2026, 7, 13, 11, 0, 5, tzinfo=UTC)
+
+    seeds = await repository.fetch_imbalance_state_seeds(
+        ((first_before, known_at), (second_before, known_at)),
+        deadband_mw=10.0,
+    )
+
+    assert seeds[0].state is ConfirmedState.POSITIVE
+    assert seeds[0].state_since == datetime(2026, 7, 13, 9, 1, tzinfo=UTC)
+    assert seeds[0].last_observed_at == datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    assert seeds[1].state is None
+    assert seeds[1].state_since is None
+    assert seeds[1].last_observed_at is None
+    assert len(client.queries) == 1
+    query, parameters, settings = client.queries[0]
+    assert "WITH requests AS" in query
+    assert "argMaxIf" in query
+    assert "FINAL" not in query.upper()
+    assert parameters["request_0_before"] == first_before
+    assert parameters["request_1_before"] == second_before
+    assert parameters["deadband_mw"] == 10.0
+    assert settings["tz_mode"] == "aware"
+
+
 def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_grant() -> None:
     schema_path = Path(__file__).parents[3] / "infra" / "clickhouse" / "001_schema.sql"
     schema = schema_path.read_text(encoding="utf-8")
@@ -658,6 +757,8 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
         assert f"CREATE TABLE IF NOT EXISTS imbalance.{table}" in schema
     assert schema.count("DateTime64(3, 'UTC')") >= 20
     assert schema.count("ReplacingMergeTree(row_version)") >= 7
+    assert "ORDER BY (event_id, event_time, row_version)" in schema
+    assert "ORDER BY (timestamp, event_id, row_version)" in schema
     assert schema.count("PARTITION BY toYYYYMM(") >= 8
     assert "TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE" in schema
     assert "GRANT SELECT, INSERT ON imbalance.* TO imbalance" in schema

@@ -14,7 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from imbalance_pipeline.config import Settings
 from imbalance_pipeline.domain.events import EventEnvelope
-from imbalance_pipeline.domain.imbalance import ImbalanceObservation
+from imbalance_pipeline.domain.imbalance import (
+    ConfirmedState,
+    ConfirmedStateSeed,
+    ImbalanceObservation,
+    VersionedImbalanceObservation,
+)
 from imbalance_pipeline.sources.elia import (
     LoadObservation,
     SolarObservation,
@@ -514,6 +519,157 @@ class ClickHouseRepository:
             raise TransientStorageError from exc
         return [_imbalance_from_row(row) for row in result.result_rows]
 
+    async def fetch_imbalance_versions(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        knowledge_cutoff: datetime,
+    ) -> list[VersionedImbalanceObservation]:
+        start_utc = _to_utc(start)
+        end_utc = _to_utc(end)
+        knowledge_cutoff_utc = _to_utc(knowledge_cutoff)
+        if start_utc > end_utc:
+            raise ValueError("start cannot be after end")
+        query = f"""
+            SELECT
+                event_id,
+                timestamp,
+                quarter_hour,
+                resolution_code,
+                quality_status,
+                ace_mw,
+                system_imbalance_mw,
+                alpha_eur_mwh,
+                alpha_prime_eur_mwh,
+                marginal_incremental_price_eur_mwh,
+                marginal_decremental_price_eur_mwh,
+                imbalance_price_eur_mwh,
+                ingested_at,
+                row_version
+            FROM {self._database}.imbalance_observations
+            WHERE timestamp >= {{start:DateTime64(3, 'UTC')}}
+              AND timestamp <= {{end:DateTime64(3, 'UTC')}}
+              AND ingested_at <= {{knowledge_cutoff:DateTime64(3, 'UTC')}}
+            ORDER BY timestamp, row_version, ingested_at, event_id
+        """
+        try:
+            result = await self._client.query(
+                query,
+                parameters={
+                    "start": start_utc,
+                    "end": end_utc,
+                    "knowledge_cutoff": knowledge_cutoff_utc,
+                },
+                tz_mode="aware",
+            )
+        except (ClickHouseError, OSError, TimeoutError) as exc:
+            raise TransientStorageError from exc
+        return [_versioned_imbalance_from_row(row) for row in result.result_rows]
+
+    async def fetch_imbalance_state_seed(
+        self,
+        before: datetime,
+        *,
+        knowledge_cutoff: datetime,
+        deadband_mw: float,
+    ) -> ConfirmedStateSeed:
+        seeds = await self.fetch_imbalance_state_seeds(
+            ((before, knowledge_cutoff),),
+            deadband_mw=deadband_mw,
+        )
+        return seeds[0]
+
+    async def fetch_imbalance_state_seeds(
+        self,
+        requests: Sequence[tuple[datetime, datetime]],
+        *,
+        deadband_mw: float,
+    ) -> list[ConfirmedStateSeed]:
+        if deadband_mw <= 0:
+            raise ValueError("deadband_mw must be positive")
+        if not requests:
+            return []
+        parameters: dict[str, object] = {"deadband_mw": deadband_mw}
+        request_queries: list[str] = []
+        for index, (before, knowledge_cutoff) in enumerate(requests):
+            before_utc = _to_utc(before)
+            knowledge_cutoff_utc = _to_utc(knowledge_cutoff)
+            parameters[f"request_{index}_before"] = before_utc
+            parameters[f"request_{index}_knowledge_cutoff"] = knowledge_cutoff_utc
+            request_queries.append(
+                f"""
+                    SELECT
+                        toUInt32({index}) AS request_index,
+                        {{request_{index}_before:DateTime64(3, 'UTC')}} AS before,
+                        {{request_{index}_knowledge_cutoff:DateTime64(3, 'UTC')}}
+                            AS knowledge_cutoff
+                """
+            )
+        query = f"""
+            WITH requests AS (
+                {' UNION ALL '.join(request_queries)}
+            ),
+            canonical AS (
+                SELECT
+                    requests.request_index,
+                    observations.timestamp,
+                    argMax(
+                        observations.system_imbalance_mw,
+                        tuple(
+                            observations.row_version,
+                            observations.ingested_at,
+                            observations.event_id
+                        )
+                    ) AS system_imbalance_mw
+                FROM {self._database}.imbalance_observations AS observations
+                INNER JOIN requests
+                    ON observations.timestamp <= requests.before
+                   AND observations.ingested_at <= requests.knowledge_cutoff
+                GROUP BY requests.request_index, observations.timestamp
+            )
+            SELECT
+                request_index,
+                if(
+                    countIf(abs(system_imbalance_mw) > {{deadband_mw:Float64}}) > 0,
+                    argMaxIf(
+                        system_imbalance_mw,
+                        timestamp,
+                        abs(system_imbalance_mw) > {{deadband_mw:Float64}}
+                    ),
+                    NULL
+                ) AS state_balance,
+                if(
+                    countIf(abs(system_imbalance_mw) > {{deadband_mw:Float64}}) > 0,
+                    argMaxIf(
+                        timestamp,
+                        timestamp,
+                        abs(system_imbalance_mw) > {{deadband_mw:Float64}}
+                    ),
+                    NULL
+                ) AS state_since,
+                max(timestamp) AS last_observed_at
+            FROM canonical
+            GROUP BY request_index
+            ORDER BY request_index
+        """
+        try:
+            result = await self._client.query(query, parameters=parameters, tz_mode="aware")
+        except (ClickHouseError, OSError, TimeoutError) as exc:
+            raise TransientStorageError from exc
+        seeds = [ConfirmedStateSeed(None, None, None) for _ in requests]
+        for row in result.result_rows:
+            index, state_balance, state_since, last_observed_at = row
+            request_index = cast(int, index)
+            if request_index < 0 or request_index >= len(seeds):
+                raise RuntimeError("ClickHouse returned an invalid state-seed request index")
+            seeds[request_index] = _state_seed_from_row(
+                state_balance,
+                state_since,
+                last_observed_at,
+            )
+        return seeds
+
     async def latest_prediction(self) -> Prediction | None:
         query = f"""
             SELECT
@@ -884,6 +1040,71 @@ def _imbalance_from_row(row: Sequence[object]) -> ImbalanceObservation:
         marginal_decremental_price_eur_mwh=cast(float | None, latest[8]),
         imbalance_price_eur_mwh=cast(float | None, latest[9]),
     )
+
+
+def _versioned_imbalance_from_row(row: Sequence[object]) -> VersionedImbalanceObservation:
+    (
+        event_id,
+        timestamp,
+        quarter_hour,
+        resolution_code,
+        quality_status,
+        ace_mw,
+        system_imbalance_mw,
+        alpha_eur_mwh,
+        alpha_prime_eur_mwh,
+        marginal_incremental_price_eur_mwh,
+        marginal_decremental_price_eur_mwh,
+        imbalance_price_eur_mwh,
+        ingested_at,
+        row_version,
+    ) = row
+    observation = ImbalanceObservation(
+        timestamp=_clickhouse_utc(cast(datetime, timestamp)),
+        quarter_hour=_clickhouse_utc(cast(datetime, quarter_hour)),
+        resolution_code=cast(str, resolution_code),
+        quality_status=cast(str, quality_status),
+        ace_mw=cast(float | None, ace_mw),
+        system_imbalance_mw=cast(float, system_imbalance_mw),
+        alpha_eur_mwh=cast(float | None, alpha_eur_mwh),
+        alpha_prime_eur_mwh=cast(float | None, alpha_prime_eur_mwh),
+        marginal_incremental_price_eur_mwh=cast(
+            float | None,
+            marginal_incremental_price_eur_mwh,
+        ),
+        marginal_decremental_price_eur_mwh=cast(
+            float | None,
+            marginal_decremental_price_eur_mwh,
+        ),
+        imbalance_price_eur_mwh=cast(float | None, imbalance_price_eur_mwh),
+    )
+    return VersionedImbalanceObservation(
+        observation=observation,
+        available_at=_clickhouse_utc(cast(datetime, ingested_at)),
+        row_version=cast(int, row_version),
+        event_id=cast(str, event_id),
+    )
+
+
+def _state_seed_from_row(
+    state_balance: object,
+    state_since: object,
+    last_observed_at: object,
+) -> ConfirmedStateSeed:
+    last_observed = (
+        None
+        if last_observed_at is None
+        else _clickhouse_utc(cast(datetime, last_observed_at))
+    )
+    if state_balance is None:
+        return ConfirmedStateSeed(None, None, last_observed)
+    state_since_utc = _clickhouse_utc(cast(datetime, state_since))
+    state = (
+        ConfirmedState.POSITIVE
+        if cast(float, state_balance) > 0
+        else ConfirmedState.NEGATIVE
+    )
+    return ConfirmedStateSeed(state, state_since_utc, last_observed)
 
 
 def _require_event_timestamp(event: EventEnvelope, timestamp: datetime) -> None:

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -30,6 +31,36 @@ class ImbalanceObservation(BaseModel):
 class ConfirmedState(StrEnum):
     POSITIVE = "positive"
     NEGATIVE = "negative"
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedStateSeed:
+    state: ConfirmedState | None
+    state_since: datetime | None
+    last_observed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if self.state is None and self.state_since is not None:
+            raise ValueError("an unknown state cannot have a state_since timestamp")
+        if self.state is not None and self.state_since is None:
+            raise ValueError("a known state requires a state_since timestamp")
+        for value in (self.state_since, self.last_observed_at):
+            if value is not None and (value.tzinfo is None or value.utcoffset() != timedelta(0)):
+                raise ValueError("state seed timestamps must be UTC-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class VersionedImbalanceObservation:
+    observation: ImbalanceObservation
+    available_at: datetime
+    row_version: int = 0
+    event_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.available_at.tzinfo is None or self.available_at.utcoffset() != timedelta(0):
+            raise ValueError("version availability timestamps must be UTC-aware")
+        if self.row_version < 0:
+            raise ValueError("row_version cannot be negative")
 
 
 def advance_state(
