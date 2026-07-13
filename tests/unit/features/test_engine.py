@@ -30,7 +30,7 @@ async def test_builds_exact_local_context_and_static_shapes_at_next_minute() -> 
     assert snapshot.knowledge_cutoff == KNOWLEDGE_CUTOFF
     assert snapshot.current_state is ConfirmedState.POSITIVE
     assert snapshot.model_eligible is True
-    assert source.calls == [(CUTOFF, 24 * 60, KNOWLEDGE_CUTOFF)]
+    assert source.calls == [(CUTOFF, 24 * 60 + 7, KNOWLEDGE_CUTOFF)]
 
 
 @pytest.mark.asyncio
@@ -74,6 +74,29 @@ async def test_missing_history_is_zero_masked_and_forces_fallback_eligibility() 
     assert np.all(snapshot.context_values[:, load_index] == 0.0)
     assert np.all(snapshot.context_masks[:, load_index] == 0)
     assert np.all(np.diff(snapshot.context_values[:, load_age_index]) >= 0.0)
+
+
+@pytest.mark.asyncio
+async def test_context_fetch_includes_the_complete_oldest_quarter_hour_bin() -> None:
+    earliest = CUTOFF - timedelta(minutes=24 * 60 + 6)
+    rows = [
+        VersionedObservation(
+            observation(
+                earliest + timedelta(minutes=index),
+                -100.0 if index < 7 else 100.0,
+            ),
+            earliest + timedelta(minutes=index, seconds=2),
+        )
+        for index in range(24 * 60 + 7)
+    ]
+    source = MemoryFeatureSource(rows)
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshot = await engine.build(CUTOFF, knowledge_cutoff=KNOWLEDGE_CUTOFF)
+    mean_index = DEFAULT_FEATURE_REGISTRY.context_names.index("imbalance_mean_mw")
+
+    assert snapshot.context_values[0, mean_index] == pytest.approx(100.0 / 15.0)
+    assert source.calls == [(CUTOFF, 24 * 60 + 7, KNOWLEDGE_CUTOFF)]
 
 
 @pytest.mark.asyncio

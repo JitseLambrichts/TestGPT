@@ -70,7 +70,7 @@ class FeatureEngine:
         knowledge = _utc(knowledge_cutoff)
         required_minutes = max(
             self._registry.local_window_minutes,
-            self._registry.context_steps * self._registry.context_resolution_minutes,
+            len(_history_times(cutoff, self._registry)),
         )
         observations = await self._source.fetch_imbalance_window(
             cutoff,
@@ -102,11 +102,8 @@ class FeatureEngine:
         knowledge_cutoff: datetime,
         observations: Sequence[ImbalanceObservation],
     ) -> FeatureSnapshot:
-        history_minutes = self._registry.context_steps * self._registry.context_resolution_minutes
-        history_start = cutoff - timedelta(minutes=history_minutes - 1)
-        history_times = tuple(
-            history_start + timedelta(minutes=index) for index in range(history_minutes)
-        )
+        history_times = _history_times(cutoff, self._registry)
+        history_start = history_times[0]
         by_timestamp = {
             _utc(observation.timestamp): observation
             for observation in sorted(observations, key=lambda row: row.timestamp)
@@ -524,6 +521,15 @@ def _static_values(cutoff: datetime) -> NDArray[np.float32]:
 
 def _floor_quarter_hour(value: datetime) -> datetime:
     return value.replace(minute=(value.minute // 15) * 15, second=0, microsecond=0)
+
+
+def _history_times(cutoff: datetime, registry: FeatureRegistry) -> tuple[datetime, ...]:
+    context_end = _floor_quarter_hour(cutoff)
+    first_context_end = context_end - timedelta(
+        minutes=(registry.context_steps - 1) * registry.context_resolution_minutes
+    )
+    history_start = first_context_end - timedelta(minutes=registry.context_resolution_minutes - 1)
+    return _minute_range(history_start, cutoff)
 
 
 def _minute_range(start: datetime, end: datetime) -> tuple[datetime, ...]:
