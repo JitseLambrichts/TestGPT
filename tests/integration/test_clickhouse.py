@@ -87,11 +87,13 @@ async def migrated_client() -> AsyncClient:
         database="default",
     )
     try:
-        schema_path = Path(__file__).parents[2] / "infra" / "clickhouse" / "001_schema.sql"
-        statements = [statement.strip() for statement in schema_path.read_text().split(";")]
-        for statement in statements:
-            if statement:
-                await admin.command(statement)
+        await admin.command(f"DROP DATABASE IF EXISTS {DATABASE} SYNC")
+        migrations = sorted((Path(__file__).parents[2] / "infra" / "clickhouse").glob("*.sql"))
+        for migration in migrations:
+            statements = [statement.strip() for statement in migration.read_text().split(";")]
+            for statement in statements:
+                if statement:
+                    await admin.command(statement)
         grants = await admin.query("SHOW GRANTS FOR imbalance")
         assert {str(row[0]) for row in grants.result_rows} == {
             "GRANT SELECT, INSERT ON imbalance.* TO imbalance"
@@ -186,6 +188,37 @@ async def test_point_in_time_query_excludes_a_late_correction_until_it_was_known
         assert len(after_correction) == 1
         assert after_correction[0].timestamp == newer.event_time
         assert after_correction[0].system_imbalance_mw == -250.0
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_state_seed_duration_starts_at_the_last_confirmed_sign_change() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    start = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)
+    observations = [
+        event(
+            event_id=f"positive-{offset}",
+            event_time=start + timedelta(minutes=offset),
+            ingested_at=start + timedelta(minutes=offset, seconds=5),
+            value=20.0,
+        )
+        for offset in (0, 1, 60)
+    ]
+    try:
+        for source in observations:
+            await repository.insert_event(source)
+
+        seed = await repository.fetch_imbalance_state_seed(
+            observations[-1].event_time,
+            knowledge_cutoff=observations[-1].ingested_at,
+            deadband_mw=10.0,
+        )
+
+        assert seed.state is not None and seed.state.value == "positive"
+        assert seed.state_since == start
+        assert seed.last_observed_at == observations[-1].event_time
     finally:
         await repository.aclose()
 

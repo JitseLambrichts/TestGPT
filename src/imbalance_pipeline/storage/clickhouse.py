@@ -58,6 +58,7 @@ MODEL_EVENT_TYPES = frozenset(
 )
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+STATE_SEED_REQUEST_BATCH_SIZE = 512
 
 
 class DeadLetterReason(StrEnum):
@@ -590,6 +591,22 @@ class ClickHouseRepository:
             raise ValueError("deadband_mw must be positive")
         if not requests:
             return []
+        seeds: list[ConfirmedStateSeed] = []
+        for start in range(0, len(requests), STATE_SEED_REQUEST_BATCH_SIZE):
+            seeds.extend(
+                await self._fetch_imbalance_state_seed_batch(
+                    requests[start : start + STATE_SEED_REQUEST_BATCH_SIZE],
+                    deadband_mw=deadband_mw,
+                )
+            )
+        return seeds
+
+    async def _fetch_imbalance_state_seed_batch(
+        self,
+        requests: Sequence[tuple[datetime, datetime]],
+        *,
+        deadband_mw: float,
+    ) -> list[ConfirmedStateSeed]:
         parameters: dict[str, object] = {"deadband_mw": deadband_mw}
         request_queries: list[str] = []
         for index, (before, knowledge_cutoff) in enumerate(requests):
@@ -627,31 +644,64 @@ class ClickHouseRepository:
                     ON observations.timestamp <= requests.before
                    AND observations.ingested_at <= requests.knowledge_cutoff
                 GROUP BY requests.request_index, observations.timestamp
+            ),
+            non_neutral AS (
+                SELECT
+                    request_index,
+                    timestamp,
+                    if(
+                        system_imbalance_mw > {{deadband_mw:Float64}},
+                        toInt8(1),
+                        toInt8(-1)
+                    ) AS state_sign
+                FROM canonical
+                WHERE abs(system_imbalance_mw) > {{deadband_mw:Float64}}
+            ),
+            state_transitions AS (
+                SELECT
+                    request_index,
+                    timestamp,
+                    state_sign,
+                    lagInFrame(state_sign, 1, toInt8(0)) OVER (
+                        PARTITION BY request_index
+                        ORDER BY timestamp
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS previous_state_sign
+                FROM non_neutral
+            ),
+            current_states AS (
+                SELECT
+                    request_index,
+                    argMax(state_sign, timestamp) AS current_state_sign,
+                    argMaxIf(
+                        timestamp,
+                        timestamp,
+                        state_sign != previous_state_sign
+                    ) AS state_since
+                FROM state_transitions
+                GROUP BY request_index
+            ),
+            latest_observations AS (
+                SELECT request_index, max(timestamp) AS last_observed_at
+                FROM canonical
+                GROUP BY request_index
             )
             SELECT
-                request_index,
+                latest_observations.request_index,
                 if(
-                    countIf(abs(system_imbalance_mw) > {{deadband_mw:Float64}}) > 0,
-                    argMaxIf(
-                        system_imbalance_mw,
-                        timestamp,
-                        abs(system_imbalance_mw) > {{deadband_mw:Float64}}
-                    ),
-                    NULL
-                ) AS state_balance,
+                    current_states.current_state_sign = 0,
+                    NULL,
+                    current_states.current_state_sign
+                ) AS state_sign,
                 if(
-                    countIf(abs(system_imbalance_mw) > {{deadband_mw:Float64}}) > 0,
-                    argMaxIf(
-                        timestamp,
-                        timestamp,
-                        abs(system_imbalance_mw) > {{deadband_mw:Float64}}
-                    ),
-                    NULL
+                    current_states.current_state_sign = 0,
+                    NULL,
+                    current_states.state_since
                 ) AS state_since,
-                max(timestamp) AS last_observed_at
-            FROM canonical
-            GROUP BY request_index
-            ORDER BY request_index
+                latest_observations.last_observed_at
+            FROM latest_observations
+            LEFT JOIN current_states USING request_index
+            ORDER BY latest_observations.request_index
         """
         try:
             result = await self._client.query(query, parameters=parameters, tz_mode="aware")

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from imbalance_pipeline.features.schema import DEFAULT_FEATURE_REGISTRY, FeatureRegistry
@@ -57,3 +59,8 @@ def test_registry_rejects_dimensions_the_feature_engine_cannot_preserve() -> Non
             features=baseline.features,
             local_window_minutes=181,
         )
+
+
+def test_registry_rejects_transform_windows_without_matching_feature_columns() -> None:
+    with pytest.raises(ValueError, match="feature contract"):
+        replace(FeatureRegistry.default(), ewm_windows=(6,))

@@ -222,6 +222,22 @@ async def test_build_many_reuses_online_transform_and_is_byte_identical() -> Non
 
 
 @pytest.mark.asyncio
+async def test_build_many_uses_bounded_chronological_source_batches() -> None:
+    cutoffs = [CUTOFF - timedelta(minutes=offset) for offset in range(513)]
+    source = MemoryFeatureSource(minute_rows(CUTOFF, 36 * 60, value=15.0))
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    snapshots = await engine.build_many(
+        cutoffs,
+        knowledge_cutoffs=[cutoff + timedelta(seconds=10) for cutoff in cutoffs],
+    )
+
+    assert [snapshot.cutoff for snapshot in snapshots] == cutoffs
+    assert len(source.version_calls) == 2
+    assert len(source.seed_batch_calls) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "cutoff",
     [

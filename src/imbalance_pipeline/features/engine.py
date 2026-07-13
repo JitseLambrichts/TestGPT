@@ -1,5 +1,5 @@
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -23,6 +23,7 @@ LOCAL_HISTORY_MINUTES = 180
 CONTEXT_STEPS = 96
 CONTEXT_RESOLUTION_MINUTES = 15
 MIN_OBSERVED_MINUTES_FOR_MODEL = 30
+FEATURE_BUILD_BATCH_SIZE = 512
 BRUSSELS = ZoneInfo("Europe/Brussels")
 
 
@@ -125,12 +126,34 @@ class FeatureEngine:
             return []
         cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
         knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
+        ordered = sorted(
+            enumerate(zip(cutoffs, knowledge, strict=True)),
+            key=lambda item: (item[1][0], item[1][1], item[0]),
+        )
+        snapshots: list[FeatureSnapshot | None] = [None] * len(cutoffs)
+        for start in range(0, len(ordered), FEATURE_BUILD_BATCH_SIZE):
+            batch = ordered[start : start + FEATURE_BUILD_BATCH_SIZE]
+            batch_cutoffs = tuple(item[1][0] for item in batch)
+            batch_knowledge = tuple(item[1][1] for item in batch)
+            built = await self._build_many_batch(batch_cutoffs, batch_knowledge)
+            for (original_index, _), snapshot in zip(batch, built, strict=True):
+                snapshots[original_index] = snapshot
+        if any(snapshot is None for snapshot in snapshots):
+            raise RuntimeError("feature batch construction did not return every requested snapshot")
+        return [snapshot for snapshot in snapshots if snapshot is not None]
+
+    async def _build_many_batch(
+        self,
+        cutoffs: Sequence[datetime],
+        knowledge: Sequence[datetime],
+    ) -> list[FeatureSnapshot]:
         starts = tuple(_history_times(cutoff, self._registry)[0] for cutoff in cutoffs)
         versions = await self._source.fetch_imbalance_versions(
             min(starts),
             max(cutoffs),
             knowledge_cutoff=max(knowledge),
         )
+        versions_by_timestamp = _index_versions(versions)
         seed_requests = tuple(
             (history_start - timedelta(minutes=1), known_at)
             for history_start, known_at in zip(starts, knowledge, strict=True)
@@ -147,7 +170,11 @@ class FeatureEngine:
                 self._transform(
                     cutoff,
                     known_at,
-                    _canonical_observations(versions, cutoff, known_at),
+                    _canonical_observations(
+                        versions_by_timestamp,
+                        _history_times(cutoff, self._registry),
+                        known_at,
+                    ),
                     seed,
                 )
             )
@@ -615,24 +642,43 @@ def _minute_range(start: datetime, end: datetime) -> tuple[datetime, ...]:
 
 
 def _canonical_observations(
-    versions: Sequence[VersionedImbalanceObservation],
-    cutoff: datetime,
+    versions_by_timestamp: Mapping[datetime, Sequence[VersionedImbalanceObservation]],
+    history_times: Sequence[datetime],
     knowledge_cutoff: datetime,
 ) -> list[ImbalanceObservation]:
-    canonical: dict[datetime, VersionedImbalanceObservation] = {}
-    for version in sorted(
-        versions,
-        key=lambda item: (
-            item.observation.timestamp,
-            item.row_version,
-            item.available_at,
-            item.event_id,
-        ),
-    ):
+    canonical: list[ImbalanceObservation] = []
+    for timestamp in history_times:
+        candidates = versions_by_timestamp.get(timestamp, ())
+        eligible = [
+            candidate
+            for candidate in candidates
+            if candidate.available_at <= knowledge_cutoff
+        ]
+        if eligible:
+            chosen = max(
+                eligible,
+                key=lambda item: (item.row_version, item.available_at, item.event_id),
+            )
+            canonical.append(chosen.observation)
+    return canonical
+
+
+def _index_versions(
+    versions: Sequence[VersionedImbalanceObservation],
+) -> dict[datetime, tuple[VersionedImbalanceObservation, ...]]:
+    grouped: dict[datetime, list[VersionedImbalanceObservation]] = {}
+    for version in versions:
         timestamp = _utc(version.observation.timestamp)
-        if timestamp <= cutoff and version.available_at <= knowledge_cutoff:
-            canonical[timestamp] = version
-    return [canonical[timestamp].observation for timestamp in sorted(canonical)]
+        grouped.setdefault(timestamp, []).append(version)
+    return {
+        timestamp: tuple(
+            sorted(
+                candidates,
+                key=lambda item: (item.row_version, item.available_at, item.event_id),
+            )
+        )
+        for timestamp, candidates in grouped.items()
+    }
 
 
 def _last_observed_at(

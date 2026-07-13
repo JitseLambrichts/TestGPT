@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS imbalance.raw_events
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(event_time)
-ORDER BY (event_id, event_time, row_version)
+ORDER BY (event_id, event_time)
 TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS imbalance.imbalance_observations
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS imbalance.imbalance_observations
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, event_id, row_version);
+ORDER BY (timestamp, event_id);
 
 CREATE TABLE IF NOT EXISTS imbalance.load_observations
 (
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS imbalance.load_observations
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, event_id, row_version);
+ORDER BY (timestamp, event_id);
 
 CREATE TABLE IF NOT EXISTS imbalance.wind_observations
 (
@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS imbalance.wind_observations
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, offshore_onshore, region, grid_connection_type, event_id, row_version);
+ORDER BY (timestamp, offshore_onshore, region, grid_connection_type, event_id);
 
 CREATE TABLE IF NOT EXISTS imbalance.solar_observations
 (
@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS imbalance.solar_observations
 )
 ENGINE = ReplacingMergeTree(row_version)
 PARTITION BY toYYYYMM(timestamp)
-ORDER BY (timestamp, region, event_id, row_version);
+ORDER BY (timestamp, region, event_id);
 
 CREATE TABLE IF NOT EXISTS imbalance.feature_snapshots
 (

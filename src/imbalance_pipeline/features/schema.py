@@ -45,7 +45,24 @@ class FeatureRegistry:
             raise ValueError("source_profile cannot be empty")
         if not self.transform_version:
             raise ValueError("transform_version cannot be empty")
-        if not all(window > 0 for window in self.ewm_windows + self.median_windows):
+        if not all(
+            (
+                self.ewm_windows,
+                self.median_windows,
+                self.robust_scale_windows,
+                self.slope_windows,
+            )
+        ):
+            raise ValueError("transform window groups cannot be empty")
+        if not all(
+            window > 0
+            for window in (
+                self.ewm_windows
+                + self.median_windows
+                + self.robust_scale_windows
+                + self.slope_windows
+            )
+        ):
             raise ValueError("transform windows must be positive")
         for group in ("local", "context", "static"):
             names = tuple(feature.name for feature in self.features if feature.group == group)
@@ -53,6 +70,17 @@ class FeatureRegistry:
                 raise ValueError(f"{group} feature names must be unique")
         if not all(feature.group in {"local", "context", "static"} for feature in self.features):
             raise ValueError("feature groups must be local, context, or static")
+        local_names = {feature.name for feature in self.features if feature.group == "local"}
+        required_transform_names = {
+            *(f"ewm_{window}_mw" for window in self.ewm_windows),
+            *(f"rolling_median_{window}_mw" for window in self.median_windows),
+            *(f"robust_scale_{window}_mw" for window in self.robust_scale_windows),
+            *(f"slope_{window}_mw_per_minute" for window in self.slope_windows),
+            f"rolling_min_{max(self.median_windows)}_mw",
+            f"rolling_max_{max(self.median_windows)}_mw",
+        }
+        if not required_transform_names <= local_names:
+            raise ValueError("transform windows must match the local feature contract")
 
     @property
     def local_names(self) -> tuple[str, ...]:

@@ -731,6 +731,7 @@ async def test_fetch_imbalance_state_seeds_batches_independent_point_in_time_sta
     query, parameters, settings = client.queries[0]
     assert "WITH requests AS" in query
     assert "argMaxIf" in query
+    assert "lagInFrame" in query
     assert "FINAL" not in query.upper()
     assert parameters["request_0_before"] == first_before
     assert parameters["request_1_before"] == second_before
@@ -738,9 +739,25 @@ async def test_fetch_imbalance_state_seeds_batches_independent_point_in_time_sta
     assert settings["tz_mode"] == "aware"
 
 
+@pytest.mark.asyncio
+async def test_fetch_imbalance_state_seeds_bounds_the_sql_request_batch_size() -> None:
+    client = RecordingClickHouseClient()
+    repository = repository_with(client)
+    before = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    requests = tuple((before, before + timedelta(seconds=5)) for _ in range(513))
+
+    seeds = await repository.fetch_imbalance_state_seeds(requests, deadband_mw=10.0)
+
+    assert len(seeds) == 513
+    assert len(client.queries) == 2
+
+
 def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_grant() -> None:
     schema_path = Path(__file__).parents[3] / "infra" / "clickhouse" / "001_schema.sql"
     schema = schema_path.read_text(encoding="utf-8")
+    version_retention = (
+        schema_path.parent / "002_preserve_source_versions.sql"
+    ).read_text(encoding="utf-8")
 
     for table in (
         "schema_migrations",
@@ -757,8 +774,8 @@ def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_gra
         assert f"CREATE TABLE IF NOT EXISTS imbalance.{table}" in schema
     assert schema.count("DateTime64(3, 'UTC')") >= 20
     assert schema.count("ReplacingMergeTree(row_version)") >= 7
-    assert "ORDER BY (event_id, event_time, row_version)" in schema
-    assert "ORDER BY (timestamp, event_id, row_version)" in schema
+    assert "ORDER BY (event_id, event_time, row_version)" in version_retention
+    assert "ORDER BY (timestamp, event_id, row_version)" in version_retention
     assert schema.count("PARTITION BY toYYYYMM(") >= 8
     assert "TTL toDateTime(event_time, 'UTC') + INTERVAL 90 DAY DELETE" in schema
     assert "GRANT SELECT, INSERT ON imbalance.* TO imbalance" in schema
