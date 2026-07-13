@@ -72,6 +72,8 @@ class IsotonicCalibrator:
             or len(x) != len(y)
             or not np.isfinite(x).all()
             or not np.isfinite(y).all()
+            or np.any((x < 0.0) | (x > 1.0))
+            or np.any((y < 0.0) | (y > 1.0))
             or np.any(np.diff(x) < 0)
             or np.any(np.diff(y) < 0)
             or not isinstance(threshold, (int, float))

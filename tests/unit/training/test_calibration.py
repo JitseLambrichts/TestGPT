@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from imbalance_pipeline.training.calibration import IsotonicCalibrator, select_f1_threshold
 
@@ -25,3 +26,15 @@ def test_threshold_selection_uses_the_lower_threshold_for_an_f1_tie() -> None:
     )
 
     assert threshold == 0.4
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"x_thresholds":[-0.1,1.0],"y_thresholds":[0.0,1.0],"decision_threshold":0.5}',
+        '{"x_thresholds":[0.0,1.0],"y_thresholds":[0.0,1.1],"decision_threshold":0.5}',
+    ],
+)
+def test_isotonic_calibration_rejects_thresholds_outside_probability_range(payload: str) -> None:
+    with pytest.raises(ValueError, match="invalid calibration payload"):
+        IsotonicCalibrator.from_json(payload)
