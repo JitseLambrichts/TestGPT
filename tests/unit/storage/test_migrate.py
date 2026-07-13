@@ -1,11 +1,14 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from clickhouse_connect.driver.exceptions import ClickHouseError
 
 from imbalance_pipeline.storage.migrate import (
     MANAGED_MIGRATIONS,
     MigrationChecksumError,
+    MigrationLocked,
     apply_migrations,
 )
 
@@ -14,12 +17,15 @@ class FakeMigrationClient:
     def __init__(self) -> None:
         self.database_exists = False
         self.ledger_exists = False
+        self.migration_lock_held = False
         self.applied: dict[int, str | bytes] = {}
         self.commands: list[str] = []
 
     async def query(self, statement: str) -> SimpleNamespace:
         if statement.startswith("EXISTS DATABASE"):
             return SimpleNamespace(first_row=(int(self.database_exists),))
+        if statement == "EXISTS TABLE demo.__migration_lock":
+            return SimpleNamespace(first_row=(int(self.migration_lock_held),))
         if statement.startswith("EXISTS TABLE"):
             return SimpleNamespace(first_row=(int(self.ledger_exists),))
         if statement.startswith("SELECT version, checksum"):
@@ -27,6 +33,15 @@ class FakeMigrationClient:
         raise AssertionError(f"unexpected query: {statement}")
 
     async def command(self, statement: str) -> None:
+        normalized = statement.lstrip()
+        if normalized.startswith("CREATE TABLE demo.__migration_lock"):
+            if self.migration_lock_held:
+                raise ClickHouseError("migration lock already exists")
+            self.migration_lock_held = True
+            return
+        if normalized.startswith("DROP TABLE IF EXISTS demo.__migration_lock"):
+            self.migration_lock_held = False
+            return
         self.commands.append(statement)
         if "CREATE DATABASE" in statement:
             self.database_exists = True
@@ -115,3 +130,51 @@ async def test_runner_accepts_clickhouse_fixed_string_checksums_as_bytes(tmp_pat
         await apply_migrations(client, database="demo", directory=tmp_path)
     finally:
         MANAGED_MIGRATIONS[2] = original
+
+
+@pytest.mark.asyncio
+async def test_runner_completes_an_unregistered_bootstrap_after_a_crash(tmp_path: Path) -> None:
+    write_migrations(tmp_path)
+    client = FakeMigrationClient()
+    client.database_exists = True
+    client.ledger_exists = True
+    original = MANAGED_MIGRATIONS[2]
+
+    async def managed(_client: FakeMigrationClient, *, database: str) -> None:
+        del database
+
+    MANAGED_MIGRATIONS[2] = managed
+    try:
+        await apply_migrations(client, database="demo", directory=tmp_path)
+    finally:
+        MANAGED_MIGRATIONS[2] = original
+
+    assert "CREATE TABLE IF NOT EXISTS demo.schema_migrations (version UInt32)" in client.commands
+    assert sorted(client.applied) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_a_second_concurrent_migration_process(tmp_path: Path) -> None:
+    write_migrations(tmp_path)
+    client = FakeMigrationClient()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = MANAGED_MIGRATIONS[2]
+
+    async def managed(_client: FakeMigrationClient, *, database: str) -> None:
+        del database
+        entered.set()
+        await release.wait()
+
+    MANAGED_MIGRATIONS[2] = managed
+    first = asyncio.create_task(apply_migrations(client, database="demo", directory=tmp_path))
+    try:
+        await entered.wait()
+        with pytest.raises(MigrationLocked, match="already running"):
+            await apply_migrations(client, database="demo", directory=tmp_path)
+    finally:
+        release.set()
+        await first
+        MANAGED_MIGRATIONS[2] = original
+
+    assert client.migration_lock_held is False

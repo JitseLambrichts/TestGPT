@@ -1,7 +1,8 @@
 import asyncio
 import hashlib
 import re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Final, cast
 
 import clickhouse_connect  # type: ignore[import-untyped]
 from clickhouse_connect.driver.asyncclient import AsyncClient  # type: ignore[import-untyped]
+from clickhouse_connect.driver.exceptions import ClickHouseError  # type: ignore[import-untyped]
 
 from imbalance_pipeline.config import get_settings
 from imbalance_pipeline.storage.migrations import migrate_source_version_retention
@@ -16,6 +18,7 @@ from imbalance_pipeline.storage.migrations import migrate_source_version_retenti
 _MIGRATION_FILE = re.compile(r"(?P<version>\d{3})_(?P<name>[a-z0-9_]+)\.sql$")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
 _LEDGER_COLUMNS: Final = ("version", "name", "checksum", "applied_at")
+_LOCK_TABLE: Final = "__migration_lock"
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +32,10 @@ class SchemaMigration:
 
 class MigrationChecksumError(RuntimeError):
     """An applied migration changed and can no longer be safely replayed."""
+
+
+class MigrationLocked(RuntimeError):
+    """Another migration process holds the fail-closed schema lock."""
 
 
 ManagedMigration = Callable[[AsyncClient], Awaitable[None]]
@@ -76,34 +83,67 @@ async def apply_migrations(
 ) -> None:
     _require_identifier(database)
     migrations = discover_migrations(directory)
-    if not await _ledger_exists(client, database):
-        await _execute_sql(client, migrations[0].sql)
-    applied = await _applied_checksums(client, database)
-    for migration in migrations:
-        checksum = applied.get(migration.version)
-        if checksum is not None:
-            if checksum != migration.checksum:
-                raise MigrationChecksumError(
-                    f"migration {migration.version:03d}_{migration.name} checksum changed"
-                )
-            continue
-        if migration.version != 1:
-            await _execute_sql(client, migration.sql)
-        managed = MANAGED_MIGRATIONS.get(migration.version)
-        if managed is not None:
-            await managed(client, database=database)
-        await client.insert(
-            f"{database}.schema_migrations",
-            [(migration.version, migration.name, migration.checksum, datetime.now(UTC))],
-            column_names=_LEDGER_COLUMNS,
+    await client.command(f"CREATE DATABASE IF NOT EXISTS {database}")
+    async with _migration_lock(client, database):
+        applied = (
+            await _applied_checksums(client, database)
+            if await _ledger_exists(client, database)
+            else {}
         )
+        for migration in migrations:
+            checksum = applied.get(migration.version)
+            if checksum is not None:
+                if checksum != migration.checksum:
+                    raise MigrationChecksumError(
+                        f"migration {migration.version:03d}_{migration.name} checksum changed"
+                    )
+                continue
+            await _execute_sql(client, migration.sql)
+            managed = MANAGED_MIGRATIONS.get(migration.version)
+            if managed is not None:
+                await managed(client, database=database)
+            await client.insert(
+                f"{database}.schema_migrations",
+                [(migration.version, migration.name, migration.checksum, datetime.now(UTC))],
+                column_names=_LEDGER_COLUMNS,
+            )
+
+
+@asynccontextmanager
+async def _migration_lock(client: AsyncClient, database: str) -> AsyncIterator[None]:
+    table = f"{database}.{_LOCK_TABLE}"
+    try:
+        await client.command(
+            f"""
+            CREATE TABLE {table}
+            (
+                acquired_at DateTime64(3, 'UTC')
+            )
+            ENGINE = Memory
+            """
+        )
+    except ClickHouseError as exc:
+        if await _table_exists(client, table):
+            raise MigrationLocked(
+                "another migration process is already running; "
+                f"inspect and drop {table} only after confirming it has stopped"
+            ) from exc
+        raise
+    try:
+        yield
+    finally:
+        await client.command(f"DROP TABLE IF EXISTS {table}")
 
 
 async def _ledger_exists(client: AsyncClient, database: str) -> bool:
     database_result = await client.query(f"EXISTS DATABASE {database}")
     if not bool(cast(int, database_result.first_row[0])):
         return False
-    table_result = await client.query(f"EXISTS TABLE {database}.schema_migrations")
+    return await _table_exists(client, f"{database}.schema_migrations")
+
+
+async def _table_exists(client: AsyncClient, table: str) -> bool:
+    table_result = await client.query(f"EXISTS TABLE {table}")
     return bool(cast(int, table_result.first_row[0]))
 
 
