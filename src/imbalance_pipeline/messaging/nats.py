@@ -1,7 +1,8 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Final
 
 import nats
@@ -43,10 +44,19 @@ class NatsMessage:
 
 
 class NatsEventBus:
-    def __init__(self, connection: NatsClient, jetstream: JetStreamContext) -> None:
+    def __init__(
+        self,
+        connection: NatsClient,
+        jetstream: JetStreamContext,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._connection = connection
         self._jetstream = jetstream
-        self._closed = asyncio.Event()
+        self._clock = clock or _utc_now
+        self._shutdown_requested = asyncio.Event()
+        self._close_completed = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._subscriptions: set[JetStreamContext.PullSubscription] = set()
 
@@ -92,7 +102,30 @@ class NatsEventBus:
             raise RuntimeError(
                 f"stream {GRID_STREAM} is sealed and cannot be reconciled without replacement"
             )
+        if "max_age" in changed and _tightens_max_age(existing.max_age):
+            await self._verify_max_age_tightening_is_safe(info)
         await self._jetstream.update_stream(config=existing.evolve(**changed))
+
+    async def _verify_max_age_tightening_is_safe(self, info: api.StreamInfo) -> None:
+        if info.state.messages == 0:
+            return
+        if info.state.first_seq <= 0:
+            raise RuntimeError(
+                f"cannot tighten {GRID_STREAM} max_age without a valid oldest sequence"
+            )
+
+        oldest = await self._jetstream.get_msg(GRID_STREAM, seq=info.state.first_seq)
+        if oldest.time is None or oldest.time.tzinfo is None or oldest.time.utcoffset() is None:
+            raise RuntimeError(f"cannot tighten {GRID_STREAM} max_age without an oldest timestamp")
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError("NATS stream reconciliation clock must be timezone-aware")
+        cutoff = now.astimezone(UTC) - timedelta(seconds=STREAM_MAX_AGE_SECONDS)
+        if oldest.time.astimezone(UTC) < cutoff:
+            raise RuntimeError(
+                f"refusing to tighten {GRID_STREAM} max_age because retained data is older "
+                "than fourteen days"
+            )
 
     async def publish(self, subject: str, event: EventEnvelope) -> None:
         await self._jetstream.publish(
@@ -102,29 +135,57 @@ class NatsEventBus:
         )
 
     async def messages(self, subject: str, durable: str) -> AsyncIterator[NatsMessage]:
-        if self._closed.is_set():
-            return
-
-        config = api.ConsumerConfig(
-            durable_name=durable,
-            ack_policy=api.AckPolicy.EXPLICIT,
-            max_deliver=CONSUMER_MAX_DELIVER,
-            backoff=list(CONSUMER_BACKOFF_SECONDS),
-            filter_subject=subject,
-        )
-        subscription = await self._jetstream.pull_subscribe(
-            subject,
-            durable=durable,
-            stream=GRID_STREAM,
-            config=config,
-        )
-        if self._closed.is_set():
-            await subscription.unsubscribe()
-            return
-
-        self._subscriptions.add(subscription)
+        subscription: JetStreamContext.PullSubscription | None = None
+        primary_error: BaseException | None = None
         try:
-            while not self._closed.is_set():
+            async with self._lifecycle_lock:
+                if self._shutdown_requested.is_set():
+                    return
+
+            config = _consumer_config(subject, durable)
+            try:
+                try:
+                    info = await self._jetstream.consumer_info(GRID_STREAM, durable)
+                except NotFoundError:
+                    if self._shutdown_requested.is_set():
+                        return
+                    subscription = await self._jetstream.pull_subscribe(
+                        subject,
+                        durable=durable,
+                        stream=GRID_STREAM,
+                        config=config,
+                    )
+                else:
+                    if self._shutdown_requested.is_set():
+                        return
+                    conflicts = _consumer_policy_conflicts(info.config, config)
+                    if conflicts:
+                        fields = ", ".join(conflicts)
+                        raise RuntimeError(
+                            f"durable consumer {durable!r} conflicts with managed fields: {fields}"
+                        )
+                    subscription = await self._jetstream.pull_subscribe_bind(
+                        consumer=durable,
+                        stream=GRID_STREAM,
+                    )
+            except (BadSubscriptionError, ConnectionClosedError):
+                if self._shutdown_requested.is_set():
+                    return
+                raise
+
+            async with self._lifecycle_lock:
+                close_after_setup = self._shutdown_requested.is_set()
+                if not close_after_setup:
+                    self._subscriptions.add(subscription)
+            if close_after_setup:
+                try:
+                    await subscription.unsubscribe()
+                except (BadSubscriptionError, ConnectionClosedError):
+                    if not self._shutdown_requested.is_set():
+                        raise
+                return
+
+            while not self._shutdown_requested.is_set():
                 try:
                     raw_messages = await subscription.fetch(
                         batch=1,
@@ -133,40 +194,134 @@ class NatsEventBus:
                 except NatsTimeoutError:
                     continue
                 except (BadSubscriptionError, ConnectionClosedError):
-                    if self._closed.is_set():
+                    if self._shutdown_requested.is_set():
                         return
                     raise
                 for raw_message in raw_messages:
                     yield NatsMessage(raw_message)
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            if subscription in self._subscriptions:
-                self._subscriptions.discard(subscription)
-                await subscription.unsubscribe()
+            cleanup = False
+            if subscription is not None:
+                async with self._lifecycle_lock:
+                    if subscription in self._subscriptions:
+                        self._subscriptions.discard(subscription)
+                        cleanup = True
+            if cleanup and subscription is not None:
+                try:
+                    await subscription.unsubscribe()
+                except BaseException as cleanup_error:
+                    if (
+                        isinstance(
+                            cleanup_error,
+                            (BadSubscriptionError, ConnectionClosedError),
+                        )
+                        and self._shutdown_requested.is_set()
+                    ):
+                        pass
+                    else:
+                        async with self._lifecycle_lock:
+                            if not self._close_completed.is_set():
+                                self._subscriptions.add(subscription)
+                        if primary_error is not None:
+                            primary_error.add_note(
+                                f"NATS unsubscribe also failed: {cleanup_error!r}"
+                            )
+                        else:
+                            raise
 
     async def aclose(self) -> None:
         async with self._close_lock:
-            if self._closed.is_set():
+            if self._close_completed.is_set():
                 return
-            self._closed.set()
-            subscriptions = tuple(self._subscriptions)
-            self._subscriptions.clear()
+
+            async with self._lifecycle_lock:
+                self._shutdown_requested.set()
+                subscriptions = tuple(self._subscriptions)
+                self._subscriptions.clear()
+
             errors: list[Exception] = []
+            failed_subscriptions: list[JetStreamContext.PullSubscription] = []
+            primary_error: BaseException | None = None
+            connection_closed = False
             try:
                 for subscription in subscriptions:
                     try:
                         await subscription.unsubscribe()
+                    except (BadSubscriptionError, ConnectionClosedError):
+                        pass
                     except Exception as exc:
                         errors.append(exc)
+                        failed_subscriptions.append(subscription)
+            except BaseException as exc:
+                primary_error = exc
             finally:
                 try:
                     await self._connection.close()
                 except Exception as exc:
-                    errors.append(exc)
+                    if primary_error is not None:
+                        primary_error.add_note(f"NATS connection close also failed: {exc!r}")
+                    else:
+                        errors.append(exc)
+                else:
+                    connection_closed = True
+                    self._close_completed.set()
+
+            if failed_subscriptions and not connection_closed:
+                async with self._lifecycle_lock:
+                    self._subscriptions.update(failed_subscriptions)
+
+            if primary_error is not None:
+                raise primary_error
 
             if len(errors) == 1:
                 raise errors[0]
             if errors:
                 raise ExceptionGroup("failed to close NATS resources", errors)
+
+
+def _consumer_config(subject: str, durable: str) -> api.ConsumerConfig:
+    return api.ConsumerConfig(
+        durable_name=durable,
+        deliver_policy=api.DeliverPolicy.ALL,
+        ack_policy=api.AckPolicy.EXPLICIT,
+        max_deliver=CONSUMER_MAX_DELIVER,
+        backoff=list(CONSUMER_BACKOFF_SECONDS),
+        filter_subject=subject,
+        replay_policy=api.ReplayPolicy.INSTANT,
+    )
+
+
+def _consumer_policy_conflicts(
+    existing: api.ConsumerConfig,
+    desired: api.ConsumerConfig,
+) -> list[str]:
+    conflicts: list[str] = []
+    for field_name in (
+        "filter_subject",
+        "ack_policy",
+        "max_deliver",
+        "deliver_policy",
+        "replay_policy",
+        "deliver_subject",
+    ):
+        if getattr(existing, field_name) != getattr(desired, field_name):
+            conflicts.append(field_name)
+    if tuple(existing.backoff or ()) != tuple(desired.backoff or ()):
+        conflicts.append("backoff")
+    return conflicts
+
+
+def _tightens_max_age(existing_max_age: float | None) -> bool:
+    return (
+        existing_max_age is None
+        or existing_max_age <= 0
+        or existing_max_age > STREAM_MAX_AGE_SECONDS
+    )
 
 
 def _grid_stream_config() -> api.StreamConfig:
@@ -188,3 +343,7 @@ def _canonical_event_json(event: EventEnvelope) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
