@@ -1,4 +1,5 @@
 import math
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ LOCAL_HISTORY_MINUTES = 180
 CONTEXT_STEPS = 96
 CONTEXT_RESOLUTION_MINUTES = 15
 MIN_OBSERVED_MINUTES_FOR_MODEL = 30
-FEATURE_BUILD_BATCH_SIZE = 512
+REPLAY_START = datetime(1970, 1, 1, tzinfo=UTC)
 BRUSSELS = ZoneInfo("Europe/Brussels")
 
 
@@ -43,13 +44,6 @@ class FeatureSource(Protocol):
         knowledge_cutoff: datetime,
         deadband_mw: float,
     ) -> ConfirmedStateSeed: ...
-
-    async def fetch_imbalance_state_seeds(
-        self,
-        requests: Sequence[tuple[datetime, datetime]],
-        *,
-        deadband_mw: float,
-    ) -> list[ConfirmedStateSeed]: ...
 
     async def fetch_imbalance_versions(
         self,
@@ -77,6 +71,75 @@ class FeatureSnapshot:
     model_eligible: bool
     observed_imbalance_minutes: int
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _StateTransformer:
+    outputs: tuple[ConfirmedState | None, ...]
+    last_changes: tuple[datetime | None, ...]
+
+
+_STATE_OPTIONS: tuple[ConfirmedState | None, ...] = (
+    None,
+    ConfirmedState.POSITIVE,
+    ConfirmedState.NEGATIVE,
+)
+_STATE_INDICES = {state: index for index, state in enumerate(_STATE_OPTIONS)}
+_IDENTITY_TRANSFORMER = _StateTransformer(_STATE_OPTIONS, (None, None, None))
+
+
+class _StateReplay:
+    def __init__(self, timestamps: Sequence[datetime], deadband_mw: float) -> None:
+        self._timestamps = tuple(timestamps)
+        self._positions = {timestamp: index for index, timestamp in enumerate(self._timestamps)}
+        self._deadband_mw = deadband_mw
+        self._size = 1
+        while self._size < len(self._timestamps):
+            self._size *= 2
+        self._tree = [_IDENTITY_TRANSFORMER] * (2 * self._size)
+
+    def update(self, timestamp: datetime, value_mw: float) -> None:
+        position = self._positions[timestamp] + self._size
+        self._tree[position] = _state_transformer(timestamp, value_mw, self._deadband_mw)
+        position //= 2
+        while position:
+            self._tree[position] = _compose_state_transformers(
+                self._tree[position * 2],
+                self._tree[position * 2 + 1],
+            )
+            position //= 2
+
+    def seed_before(
+        self,
+        before: datetime,
+        observations: Mapping[datetime, ImbalanceObservation],
+    ) -> ConfirmedStateSeed:
+        transformer = self._prefix(bisect_left(self._timestamps, before))
+        state = transformer.outputs[0]
+        state_since = transformer.last_changes[0] if state is not None else None
+        index = bisect_left(self._timestamps, before) - 1
+        while index >= 0:
+            timestamp = self._timestamps[index]
+            if timestamp in observations:
+                return ConfirmedStateSeed(state, state_since, timestamp)
+            index -= 1
+        return ConfirmedStateSeed(state, state_since, None)
+
+    def _prefix(self, end: int) -> _StateTransformer:
+        left = _IDENTITY_TRANSFORMER
+        right = _IDENTITY_TRANSFORMER
+        start = self._size
+        stop = self._size + end
+        while start < stop:
+            if start % 2:
+                left = _compose_state_transformers(left, self._tree[start])
+                start += 1
+            if stop % 2:
+                stop -= 1
+                right = _compose_state_transformers(self._tree[stop], right)
+            start //= 2
+            stop //= 2
+        return _compose_state_transformers(left, right)
 
 
 class FeatureEngine:
@@ -126,59 +189,67 @@ class FeatureEngine:
             return []
         cutoffs = tuple(_utc(cutoff) for cutoff in event_cutoffs)
         knowledge = tuple(_utc(cutoff) for cutoff in knowledge_cutoffs)
-        ordered = sorted(
-            enumerate(zip(cutoffs, knowledge, strict=True)),
-            key=lambda item: (item[1][0], item[1][1], item[0]),
-        )
-        snapshots: list[FeatureSnapshot | None] = [None] * len(cutoffs)
-        for start in range(0, len(ordered), FEATURE_BUILD_BATCH_SIZE):
-            batch = ordered[start : start + FEATURE_BUILD_BATCH_SIZE]
-            batch_cutoffs = tuple(item[1][0] for item in batch)
-            batch_knowledge = tuple(item[1][1] for item in batch)
-            built = await self._build_many_batch(batch_cutoffs, batch_knowledge)
-            for (original_index, _), snapshot in zip(batch, built, strict=True):
-                snapshots[original_index] = snapshot
-        if any(snapshot is None for snapshot in snapshots):
-            raise RuntimeError("feature batch construction did not return every requested snapshot")
-        return [snapshot for snapshot in snapshots if snapshot is not None]
-
-    async def _build_many_batch(
-        self,
-        cutoffs: Sequence[datetime],
-        knowledge: Sequence[datetime],
-    ) -> list[FeatureSnapshot]:
-        starts = tuple(_history_times(cutoff, self._registry)[0] for cutoff in cutoffs)
         versions = await self._source.fetch_imbalance_versions(
-            min(starts),
+            REPLAY_START,
             max(cutoffs),
             knowledge_cutoff=max(knowledge),
         )
-        versions_by_timestamp = _index_versions(versions)
-        seed_requests = tuple(
-            (history_start - timedelta(minutes=1), known_at)
-            for history_start, known_at in zip(starts, knowledge, strict=True)
+        return self._replay_versions(cutoffs, knowledge, versions)
+
+    def _replay_versions(
+        self,
+        cutoffs: Sequence[datetime],
+        knowledge: Sequence[datetime],
+        versions: Sequence[VersionedImbalanceObservation],
+    ) -> list[FeatureSnapshot]:
+        timestamps = tuple(sorted({_utc(version.observation.timestamp) for version in versions}))
+        replay = _StateReplay(timestamps, self._registry.deadband_mw)
+        ordered_versions = sorted(
+            versions,
+            key=lambda item: (
+                item.available_at,
+                item.row_version,
+                item.event_id,
+                item.observation.timestamp,
+            ),
         )
-        seeds = await self._source.fetch_imbalance_state_seeds(
-            seed_requests,
-            deadband_mw=self._registry.deadband_mw,
+        requests = sorted(
+            enumerate(zip(cutoffs, knowledge, strict=True)),
+            key=lambda item: (item[1][1], item[1][0], item[0]),
         )
-        if len(seeds) != len(cutoffs):
-            raise RuntimeError("feature source returned an unexpected number of state seeds")
-        snapshots: list[FeatureSnapshot] = []
-        for cutoff, known_at, seed in zip(cutoffs, knowledge, seeds, strict=True):
-            snapshots.append(
-                self._transform(
-                    cutoff,
-                    known_at,
-                    _canonical_observations(
-                        versions_by_timestamp,
-                        _history_times(cutoff, self._registry),
-                        known_at,
-                    ),
-                    seed,
-                )
+        best_versions: dict[datetime, tuple[int, datetime, str]] = {}
+        observations: dict[datetime, ImbalanceObservation] = {}
+        snapshots: list[FeatureSnapshot | None] = [None] * len(cutoffs)
+        version_index = 0
+        for original_index, (cutoff, known_at) in requests:
+            while (
+                version_index < len(ordered_versions)
+                and ordered_versions[version_index].available_at <= known_at
+            ):
+                version = ordered_versions[version_index]
+                timestamp = _utc(version.observation.timestamp)
+                rank = (version.row_version, version.available_at, version.event_id)
+                if rank >= best_versions.get(timestamp, (-1, REPLAY_START, "")):
+                    best_versions[timestamp] = rank
+                    observations[timestamp] = version.observation
+                    replay.update(timestamp, version.observation.system_imbalance_mw)
+                version_index += 1
+            history_times = _history_times(cutoff, self._registry)
+            state_seed = replay.seed_before(history_times[0], observations)
+            history_observations = [
+                observations[timestamp]
+                for timestamp in history_times
+                if timestamp in observations
+            ]
+            snapshots[original_index] = self._transform(
+                cutoff,
+                known_at,
+                history_observations,
+                state_seed,
             )
-        return snapshots
+        if any(snapshot is None for snapshot in snapshots):
+            raise RuntimeError("feature replay did not return every requested snapshot")
+        return [snapshot for snapshot in snapshots if snapshot is not None]
 
     def _transform(
         self,
@@ -641,44 +712,31 @@ def _minute_range(start: datetime, end: datetime) -> tuple[datetime, ...]:
     return tuple(start + timedelta(minutes=offset) for offset in range(count))
 
 
-def _canonical_observations(
-    versions_by_timestamp: Mapping[datetime, Sequence[VersionedImbalanceObservation]],
-    history_times: Sequence[datetime],
-    knowledge_cutoff: datetime,
-) -> list[ImbalanceObservation]:
-    canonical: list[ImbalanceObservation] = []
-    for timestamp in history_times:
-        candidates = versions_by_timestamp.get(timestamp, ())
-        eligible = [
-            candidate
-            for candidate in candidates
-            if candidate.available_at <= knowledge_cutoff
-        ]
-        if eligible:
-            chosen = max(
-                eligible,
-                key=lambda item: (item.row_version, item.available_at, item.event_id),
-            )
-            canonical.append(chosen.observation)
-    return canonical
+def _state_transformer(
+    timestamp: datetime,
+    value_mw: float,
+    deadband_mw: float,
+) -> _StateTransformer:
+    outputs: list[ConfirmedState | None] = []
+    changes: list[datetime | None] = []
+    for previous in _STATE_OPTIONS:
+        current = advance_state(previous, value_mw, deadband_mw)
+        outputs.append(current)
+        changes.append(timestamp if current is not previous else None)
+    return _StateTransformer(tuple(outputs), tuple(changes))
 
 
-def _index_versions(
-    versions: Sequence[VersionedImbalanceObservation],
-) -> dict[datetime, tuple[VersionedImbalanceObservation, ...]]:
-    grouped: dict[datetime, list[VersionedImbalanceObservation]] = {}
-    for version in versions:
-        timestamp = _utc(version.observation.timestamp)
-        grouped.setdefault(timestamp, []).append(version)
-    return {
-        timestamp: tuple(
-            sorted(
-                candidates,
-                key=lambda item: (item.row_version, item.available_at, item.event_id),
-            )
-        )
-        for timestamp, candidates in grouped.items()
-    }
+def _compose_state_transformers(
+    left: _StateTransformer,
+    right: _StateTransformer,
+) -> _StateTransformer:
+    outputs: list[ConfirmedState | None] = []
+    changes: list[datetime | None] = []
+    for index, middle in enumerate(left.outputs):
+        right_index = _STATE_INDICES[middle]
+        outputs.append(right.outputs[right_index])
+        changes.append(right.last_changes[right_index] or left.last_changes[index])
+    return _StateTransformer(tuple(outputs), tuple(changes))
 
 
 def _last_observed_at(

@@ -275,11 +275,14 @@ async def test_versioned_reads_survive_clickhouse_merges_and_preserve_knowledge_
             original.event_time,
             knowledge_cutoff=correction.ingested_at,
         )
-        before, after = await repository.fetch_imbalance_state_seeds(
-            (
-                (original.event_time, original.ingested_at),
-                (correction.event_time, correction.ingested_at),
-            ),
+        before = await repository.fetch_imbalance_state_seed(
+            original.event_time,
+            knowledge_cutoff=original.ingested_at,
+            deadband_mw=10.0,
+        )
+        after = await repository.fetch_imbalance_state_seed(
+            correction.event_time,
+            knowledge_cutoff=correction.ingested_at,
             deadband_mw=10.0,
         )
 

@@ -1,9 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
 from imbalance_pipeline.domain.imbalance import (
+    ConfirmedState,
     ConfirmedStateSeed,
     ImbalanceObservation,
     VersionedImbalanceObservation,
+    advance_state,
 )
 
 VersionedObservation = VersionedImbalanceObservation
@@ -41,10 +43,9 @@ class MemoryFeatureSource:
         state_seed: ConfirmedStateSeed | None = None,
     ) -> None:
         self.rows = rows
-        self.state_seed = state_seed or ConfirmedStateSeed(None, None, None)
+        self.state_seed = state_seed
         self.calls: list[tuple[datetime, int, datetime]] = []
         self.seed_calls: list[tuple[datetime, datetime]] = []
-        self.seed_batch_calls: list[tuple[tuple[datetime, datetime], ...]] = []
         self.version_calls: list[tuple[datetime, datetime, datetime]] = []
 
     async def fetch_imbalance_window(
@@ -70,19 +71,21 @@ class MemoryFeatureSource:
         knowledge_cutoff: datetime,
         deadband_mw: float,
     ) -> ConfirmedStateSeed:
-        del deadband_mw
         self.seed_calls.append((before, knowledge_cutoff))
-        return self.state_seed
-
-    async def fetch_imbalance_state_seeds(
-        self,
-        requests: tuple[tuple[datetime, datetime], ...],
-        *,
-        deadband_mw: float,
-    ) -> list[ConfirmedStateSeed]:
-        del deadband_mw
-        self.seed_batch_calls.append(requests)
-        return [self.state_seed for _ in requests]
+        if self.state_seed is not None:
+            return self.state_seed
+        state: ConfirmedState | None = None
+        state_since: datetime | None = None
+        last_observed_at: datetime | None = None
+        for row in sorted(self.rows, key=lambda item: item.observation.timestamp):
+            if row.observation.timestamp > before or row.available_at > knowledge_cutoff:
+                continue
+            next_state = advance_state(state, row.observation.system_imbalance_mw, deadband_mw)
+            if next_state is not state:
+                state_since = row.observation.timestamp
+            state = next_state
+            last_observed_at = row.observation.timestamp
+        return ConfirmedStateSeed(state, state_since, last_observed_at)
 
     async def fetch_imbalance_versions(
         self,

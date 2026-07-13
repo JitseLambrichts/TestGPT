@@ -58,7 +58,6 @@ MODEL_EVENT_TYPES = frozenset(
 )
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-STATE_SEED_REQUEST_BATCH_SIZE = 512
 
 
 class DeadLetterReason(StrEnum):
@@ -575,31 +574,11 @@ class ClickHouseRepository:
         knowledge_cutoff: datetime,
         deadband_mw: float,
     ) -> ConfirmedStateSeed:
-        seeds = await self.fetch_imbalance_state_seeds(
+        seeds = await self._fetch_imbalance_state_seed_batch(
             ((before, knowledge_cutoff),),
             deadband_mw=deadband_mw,
         )
         return seeds[0]
-
-    async def fetch_imbalance_state_seeds(
-        self,
-        requests: Sequence[tuple[datetime, datetime]],
-        *,
-        deadband_mw: float,
-    ) -> list[ConfirmedStateSeed]:
-        if deadband_mw <= 0:
-            raise ValueError("deadband_mw must be positive")
-        if not requests:
-            return []
-        seeds: list[ConfirmedStateSeed] = []
-        for start in range(0, len(requests), STATE_SEED_REQUEST_BATCH_SIZE):
-            seeds.extend(
-                await self._fetch_imbalance_state_seed_batch(
-                    requests[start : start + STATE_SEED_REQUEST_BATCH_SIZE],
-                    deadband_mw=deadband_mw,
-                )
-            )
-        return seeds
 
     async def _fetch_imbalance_state_seed_batch(
         self,
@@ -607,6 +586,8 @@ class ClickHouseRepository:
         *,
         deadband_mw: float,
     ) -> list[ConfirmedStateSeed]:
+        if deadband_mw <= 0:
+            raise ValueError("deadband_mw must be positive")
         parameters: dict[str, object] = {"deadband_mw": deadband_mw}
         request_queries: list[str] = []
         for index, (before, knowledge_cutoff) in enumerate(requests):

@@ -217,12 +217,12 @@ async def test_build_many_reuses_online_transform_and_is_byte_identical() -> Non
         np.testing.assert_array_equal(online.static_values, expected.static_values)
         assert online.feature_schema_hash == expected.feature_schema_hash
     assert len(source.version_calls) == 1
-    assert len(source.seed_batch_calls) == 1
+    assert source.version_calls[0][0] == datetime(1970, 1, 1, tzinfo=UTC)
     assert len(source.seed_calls) == 10
 
 
 @pytest.mark.asyncio
-async def test_build_many_uses_bounded_chronological_source_batches() -> None:
+async def test_build_many_uses_one_ordered_version_replay() -> None:
     cutoffs = [CUTOFF - timedelta(minutes=offset) for offset in range(513)]
     source = MemoryFeatureSource(minute_rows(CUTOFF, 36 * 60, value=15.0))
     engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
@@ -233,8 +233,38 @@ async def test_build_many_uses_bounded_chronological_source_batches() -> None:
     )
 
     assert [snapshot.cutoff for snapshot in snapshots] == cutoffs
-    assert len(source.version_calls) == 2
-    assert len(source.seed_batch_calls) == 2
+    assert len(source.version_calls) == 1
+    assert source.seed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_build_many_replays_late_corrections_before_the_local_window() -> None:
+    timestamp = CUTOFF - timedelta(minutes=2_000)
+    original = VersionedObservation(
+        observation(timestamp, 25.0),
+        CUTOFF - timedelta(seconds=1),
+        row_version=1,
+        event_id="original",
+    )
+    correction = VersionedObservation(
+        observation(timestamp, -25.0),
+        CUTOFF + timedelta(seconds=5),
+        row_version=2,
+        event_id="correction",
+    )
+    source = MemoryFeatureSource([original, correction])
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+
+    before, after = await engine.build_many(
+        [CUTOFF, CUTOFF],
+        knowledge_cutoffs=[CUTOFF, CUTOFF + timedelta(seconds=10)],
+    )
+    state_index = DEFAULT_FEATURE_REGISTRY.local_names.index("confirmed_state_sign")
+
+    assert before.current_state is ConfirmedState.POSITIVE
+    assert before.local_values[-1, state_index] == 1.0
+    assert after.current_state is ConfirmedState.NEGATIVE
+    assert after.local_values[-1, state_index] == -1.0
 
 
 @pytest.mark.asyncio

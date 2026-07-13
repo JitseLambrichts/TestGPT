@@ -700,56 +700,33 @@ async def test_fetch_imbalance_versions_keeps_all_known_corrections_for_pit_read
 
 
 @pytest.mark.asyncio
-async def test_fetch_imbalance_state_seeds_batches_independent_point_in_time_states() -> None:
+async def test_fetch_imbalance_state_seed_is_point_in_time_safe() -> None:
     client = RecordingClickHouseClient()
     client.query_rows = [
-        (
-            0,
-            25.0,
-            datetime(2026, 7, 13, 9, 1),
-            datetime(2026, 7, 13, 10, 0),
-        ),
-        (1, None, None, None),
+        (0, 25.0, datetime(2026, 7, 13, 9, 1), datetime(2026, 7, 13, 10, 0)),
     ]
     repository = repository_with(client)
-    first_before = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
-    second_before = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
+    before = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
     known_at = datetime(2026, 7, 13, 11, 0, 5, tzinfo=UTC)
 
-    seeds = await repository.fetch_imbalance_state_seeds(
-        ((first_before, known_at), (second_before, known_at)),
+    seed = await repository.fetch_imbalance_state_seed(
+        before,
+        knowledge_cutoff=known_at,
         deadband_mw=10.0,
     )
 
-    assert seeds[0].state is ConfirmedState.POSITIVE
-    assert seeds[0].state_since == datetime(2026, 7, 13, 9, 1, tzinfo=UTC)
-    assert seeds[0].last_observed_at == datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
-    assert seeds[1].state is None
-    assert seeds[1].state_since is None
-    assert seeds[1].last_observed_at is None
+    assert seed.state is ConfirmedState.POSITIVE
+    assert seed.state_since == datetime(2026, 7, 13, 9, 1, tzinfo=UTC)
+    assert seed.last_observed_at == datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
     assert len(client.queries) == 1
     query, parameters, settings = client.queries[0]
     assert "WITH requests AS" in query
     assert "argMaxIf" in query
     assert "lagInFrame" in query
     assert "FINAL" not in query.upper()
-    assert parameters["request_0_before"] == first_before
-    assert parameters["request_1_before"] == second_before
+    assert parameters["request_0_before"] == before
     assert parameters["deadband_mw"] == 10.0
     assert settings["tz_mode"] == "aware"
-
-
-@pytest.mark.asyncio
-async def test_fetch_imbalance_state_seeds_bounds_the_sql_request_batch_size() -> None:
-    client = RecordingClickHouseClient()
-    repository = repository_with(client)
-    before = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
-    requests = tuple((before, before + timedelta(seconds=5)) for _ in range(513))
-
-    seeds = await repository.fetch_imbalance_state_seeds(requests, deadband_mw=10.0)
-
-    assert len(seeds) == 513
-    assert len(client.queries) == 2
 
 
 def test_clickhouse_schema_covers_all_tables_utc_versions_partitions_ttl_and_grant() -> None:
