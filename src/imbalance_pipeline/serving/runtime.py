@@ -2,6 +2,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import onnxruntime as ort  # type: ignore[import-untyped]
@@ -53,18 +54,23 @@ class OnnxEnsemble:
         if not validation.valid:
             raise ValueError(validation.reason or "model bundle validation failed")
         self._manifest = ModelManifest.load(self._bundle_dir)
-        _require_runtime_contract(self._manifest)
+        input_shapes = _require_runtime_contract(self._manifest)
         self._preprocessor = _load_preprocessor(
             self._bundle_dir / self._manifest.preprocessing_file,
             expected_schema_hash,
+            input_shapes,
         )
         self._calibrator = _load_calibrator(self._bundle_dir / self._manifest.calibration_file)
         options = ort.SessionOptions()
         options.intra_op_num_threads = intra_op_num_threads
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        self._sessions = tuple(
-            _load_session(self._bundle_dir / member, options) for member in self._manifest.members
+        loaded_sessions = tuple(
+            _load_session(self._bundle_dir / member, options, input_shapes)
+            for member in self._manifest.members
         )
+        if len({components for _, components in loaded_sessions}) != 1:
+            raise ValueError("ONNX ensemble members must use one mixture component count")
+        self._sessions = tuple(session for session, _ in loaded_sessions)
         self._deadband_mw = deadband_mw
 
     @property
@@ -87,10 +93,15 @@ class OnnxEnsemble:
         raw_flip_probability = _sigmoid(_average_scalar(outputs, 3, "flip_logit"))
         flip_probability = float(self._calibrator.predict(np.asarray([raw_flip_probability]))[0])
         delta = _average_scalar(outputs, 4, "delta")
-        predicted_state = advance_state(snapshot.current_state, median, self._deadband_mw)
         will_flip = (
             snapshot.current_state is not None
             and flip_probability >= self._calibrator.decision_threshold
+        )
+        predicted_state = _predicted_state(
+            snapshot.current_state,
+            median,
+            will_flip,
+            self._deadband_mw,
         )
         return PredictionValues(
             model_version=self._manifest.model_version,
@@ -106,18 +117,45 @@ class OnnxEnsemble:
         )
 
 
-def _require_runtime_contract(manifest: ModelManifest) -> None:
+def _require_runtime_contract(manifest: ModelManifest) -> dict[str, tuple[int, ...]]:
     if manifest.output_names != OUTPUT_NAMES:
         raise ValueError("model manifest output names do not match the runtime contract")
+    expected_ranks = {"local": 2, "context": 2, "static": 1}
+    if set(manifest.input_shapes) != set(expected_ranks):
+        raise ValueError("model manifest input shapes do not match the runtime contract")
+    input_shapes: dict[str, tuple[int, ...]] = {}
+    for name, rank in expected_ranks.items():
+        value = manifest.input_shapes[name]
+        if (
+            not isinstance(value, list)
+            or len(value) != rank + 1
+            or value[0] != -1
+            or not all(isinstance(dimension, int) and dimension > 0 for dimension in value[1:])
+        ):
+            raise ValueError("model manifest input shapes do not match the runtime contract")
+        input_shapes[name] = tuple(value[1:])
+    return input_shapes
 
 
-def _load_preprocessor(path: Path, expected_schema_hash: str) -> RobustPreprocessor:
+def _load_preprocessor(
+    path: Path,
+    expected_schema_hash: str,
+    input_shapes: Mapping[str, tuple[int, ...]],
+) -> RobustPreprocessor:
     try:
         preprocessor = RobustPreprocessor.from_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError("invalid preprocessing artifact") from exc
     if preprocessor.feature_schema_hash != expected_schema_hash:
         raise ValueError("preprocessing schema hash does not match")
+    feature_names = {
+        "local": preprocessor.local_names,
+        "context": preprocessor.context_names,
+        "static": preprocessor.static_names,
+    }
+    for name, names in feature_names.items():
+        if len(names) != len(set(names)) or input_shapes[name][-1] != len(names):
+            raise ValueError("preprocessing dimensions do not match model input shapes")
     return preprocessor
 
 
@@ -128,7 +166,11 @@ def _load_calibrator(path: Path) -> IsotonicCalibrator:
         raise ValueError("invalid calibration artifact") from exc
 
 
-def _load_session(path: Path, options: ort.SessionOptions) -> ort.InferenceSession:
+def _load_session(
+    path: Path,
+    options: ort.SessionOptions,
+    input_shapes: Mapping[str, tuple[int, ...]],
+) -> tuple[ort.InferenceSession, int]:
     try:
         session = ort.InferenceSession(
             str(path),
@@ -139,11 +181,80 @@ def _load_session(path: Path, options: ort.SessionOptions) -> ort.InferenceSessi
         raise ValueError(f"cannot load ONNX member {path.name}") from exc
     if "CPUExecutionProvider" not in session.get_providers():
         raise ValueError("ONNX CPU execution provider is unavailable")
-    input_names = tuple(item.name for item in session.get_inputs())
-    output_names = tuple(item.name for item in session.get_outputs())
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    input_names = tuple(item.name for item in inputs)
+    output_names = tuple(item.name for item in outputs)
     if input_names != INPUT_NAMES or output_names != OUTPUT_NAMES:
         raise ValueError("ONNX member input or output contract does not match")
-    return session
+    return session, _validate_session_io(inputs, outputs, input_shapes)
+
+
+def _validate_session_io(
+    inputs: list[Any],
+    outputs: list[Any],
+    input_shapes: Mapping[str, tuple[int, ...]],
+) -> int:
+    expected_inputs = {
+        "local": input_shapes["local"],
+        "local_mask": input_shapes["local"],
+        "context": input_shapes["context"],
+        "context_mask": input_shapes["context"],
+        "static": input_shapes["static"],
+        "static_mask": input_shapes["static"],
+    }
+    for node in inputs:
+        if node.type != "tensor(float)" or not _matches_feature_shape(
+            node.shape,
+            expected_inputs[node.name],
+        ):
+            raise ValueError("ONNX member input shapes do not match the model manifest")
+    mixture_widths: list[int] = []
+    for node in outputs[:3]:
+        if node.type != "tensor(float)" or not _matches_feature_shape(node.shape, None):
+            raise ValueError("ONNX member mixture outputs do not match the runtime contract")
+        mixture_widths.append(int(node.shape[1]))
+    if len(set(mixture_widths)) != 1 or mixture_widths[0] < 2:
+        raise ValueError("ONNX member mixture outputs do not share a valid component count")
+    scalar_outputs = outputs[3:5]
+    if any(
+        node.type != "tensor(float)" or not _matches_feature_shape(node.shape, ())
+        for node in scalar_outputs
+    ):
+        raise ValueError("ONNX member scalar outputs do not match the runtime contract")
+    auxiliary = outputs[5]
+    if auxiliary.type != "tensor(float)" or not _matches_feature_shape(auxiliary.shape, (3,)):
+        raise ValueError("ONNX member auxiliary output does not match the runtime contract")
+    return mixture_widths[0]
+
+
+def _matches_feature_shape(shape: object, fixed_dimensions: tuple[int, ...] | None) -> bool:
+    if not isinstance(shape, list) or not shape or not isinstance(shape[0], (str, type(None))):
+        return False
+    if fixed_dimensions is None:
+        return (
+            len(shape) == 2
+            and isinstance(shape[1], int)
+            and not isinstance(shape[1], bool)
+            and shape[1] > 0
+        )
+    return len(shape) == len(fixed_dimensions) + 1 and all(
+        isinstance(actual, int) and not isinstance(actual, bool) and actual == expected
+        for actual, expected in zip(shape[1:], fixed_dimensions, strict=True)
+    )
+
+
+def _predicted_state(
+    current_state: ConfirmedState | None,
+    median_mw: float,
+    will_flip: bool,
+    deadband_mw: float,
+) -> ConfirmedState | None:
+    if current_state is ConfirmedState.POSITIVE:
+        return ConfirmedState.NEGATIVE if will_flip else current_state
+    if current_state is ConfirmedState.NEGATIVE:
+        return ConfirmedState.POSITIVE if will_flip else current_state
+    return advance_state(None, median_mw, deadband_mw)
 
 
 def _session_inputs(prepared: PreparedFeatures) -> Mapping[str, NDArray[np.float32]]:

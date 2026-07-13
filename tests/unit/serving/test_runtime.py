@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
@@ -32,6 +33,23 @@ def test_onnx_ensemble_returns_deterministic_calibrated_distribution(tmp_path: P
     assert isinstance(first.will_flip, bool)
     assert first.current_state is ConfirmedState.POSITIVE
     assert first.predicted_state in (ConfirmedState.POSITIVE, ConfirmedState.NEGATIVE)
+    if first.will_flip:
+        assert first.predicted_state is ConfirmedState.NEGATIVE
+    else:
+        assert first.predicted_state is ConfirmedState.POSITIVE
+
+
+def test_onnx_ensemble_rejects_an_input_shape_inconsistent_with_preprocessing(
+    tmp_path: Path,
+) -> None:
+    bundle = _write_bundle(tmp_path / "bundle")
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["input_shapes"]["local"] = [-1, 12, 9]
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input shapes"):
+        OnnxEnsemble(bundle, expected_schema_hash=SCHEMA)
 
 
 def _snapshot() -> FeatureSnapshot:

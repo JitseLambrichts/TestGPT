@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from imbalance_pipeline.model.bundle import ModelManifest, validate_bundle
+from imbalance_pipeline.model.bundle import ModelManifest, promote_bundle, validate_bundle
 
 SCHEMA = "a" * 64
 
@@ -75,3 +75,51 @@ def test_manifest_rejects_wrong_member_count_and_path_traversal(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="invalid model manifest"):
         ModelManifest.load(bundle)
+
+
+@pytest.mark.parametrize("model_version", ["../outside", "/outside", "production", "."])
+def test_manifest_rejects_unsafe_model_versions(tmp_path: Path, model_version: str) -> None:
+    bundle = write_bundle(tmp_path / "bundle")
+    payload = json.loads((bundle / "manifest.json").read_text())
+    payload["model_version"] = model_version
+    (bundle / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid model manifest"):
+        ModelManifest.load(bundle)
+
+
+def test_manifest_requires_unique_members_and_validate_rejects_symlink_artifacts(
+    tmp_path: Path,
+) -> None:
+    duplicate = write_bundle(tmp_path / "duplicate")
+    payload = json.loads((duplicate / "manifest.json").read_text())
+    payload["members"] = ["member-0.onnx", "member-0.onnx", "member-2.onnx"]
+    (duplicate / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid model manifest"):
+        ModelManifest.load(duplicate)
+
+    linked = write_bundle(tmp_path / "linked")
+    outside = tmp_path / "outside.onnx"
+    outside.write_bytes(b"member-0")
+    (linked / "member-0.onnx").unlink()
+    (linked / "member-0.onnx").symlink_to(outside)
+
+    validation = validate_bundle(linked, expected_schema_hash=SCHEMA)
+
+    assert validation.valid is False
+    assert "symlink" in (validation.reason or "")
+
+
+def test_promotion_copies_only_validated_artifacts_and_revalidates_before_activation(
+    tmp_path: Path,
+) -> None:
+    candidate = write_bundle(tmp_path / "candidate")
+    (candidate / "untracked.txt").write_text("must not be promoted", encoding="utf-8")
+
+    destination = promote_bundle(candidate, tmp_path / "models")
+
+    assert destination == tmp_path / "models" / "test-v1"
+    assert not (destination / "untracked.txt").exists()
+    assert validate_bundle(destination, expected_schema_hash=SCHEMA).valid is True
+    assert (tmp_path / "models" / "production").resolve() == destination
