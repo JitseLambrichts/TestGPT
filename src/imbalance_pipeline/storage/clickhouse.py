@@ -736,24 +736,48 @@ class ClickHouseRepository:
     async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]:
         target = _clickhouse_utc(target_time)
         query = f"""
+            WITH canonical AS (
+                SELECT
+                    event_id,
+                    argMax(
+                        tuple(
+                            cutoff,
+                            target_time,
+                            generated_at,
+                            system_imbalance_mw,
+                            p10_mw,
+                            p90_mw,
+                            flip_probability,
+                            will_flip,
+                            current_state,
+                            predicted_state,
+                            prediction_quality,
+                            model_version,
+                            feature_schema_hash
+                        ),
+                        tuple(row_version, generated_at, event_id)
+                    ) AS versioned
+                FROM {self._database}.predictions
+                WHERE target_time = {{target_time:DateTime64(3, 'UTC')}}
+                  AND generated_at <= {{target_time:DateTime64(3, 'UTC')}}
+                GROUP BY event_id
+            )
             SELECT
                 event_id,
-                argMax(cutoff, row_version) AS cutoff,
-                argMax(target_time, row_version) AS prediction_target_time,
-                argMax(generated_at, row_version) AS generated_at,
-                argMax(system_imbalance_mw, row_version) AS system_imbalance_mw,
-                argMax(p10_mw, row_version) AS p10_mw,
-                argMax(p90_mw, row_version) AS p90_mw,
-                argMax(flip_probability, row_version) AS flip_probability,
-                argMax(will_flip, row_version) AS will_flip,
-                argMax(current_state, row_version) AS current_state,
-                argMax(predicted_state, row_version) AS predicted_state,
-                argMax(prediction_quality, row_version) AS prediction_quality,
-                argMax(model_version, row_version) AS model_version,
-                argMax(feature_schema_hash, row_version) AS feature_schema_hash
-            FROM {self._database}.predictions
-            WHERE target_time = {{target_time:DateTime64(3, 'UTC')}}
-            GROUP BY event_id
+                tupleElement(versioned, 1) AS cutoff,
+                tupleElement(versioned, 2) AS prediction_target_time,
+                tupleElement(versioned, 3) AS generated_at,
+                tupleElement(versioned, 4) AS system_imbalance_mw,
+                tupleElement(versioned, 5) AS p10_mw,
+                tupleElement(versioned, 6) AS p90_mw,
+                tupleElement(versioned, 7) AS flip_probability,
+                tupleElement(versioned, 8) AS will_flip,
+                tupleElement(versioned, 9) AS current_state,
+                tupleElement(versioned, 10) AS predicted_state,
+                tupleElement(versioned, 11) AS prediction_quality,
+                tupleElement(versioned, 12) AS model_version,
+                tupleElement(versioned, 13) AS feature_schema_hash
+            FROM canonical
             ORDER BY event_id
         """
         try:

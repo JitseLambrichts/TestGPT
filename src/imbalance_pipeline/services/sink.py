@@ -140,7 +140,7 @@ def _stored_event(source: EventEnvelope) -> EventEnvelope:
         event_id=event_id(
             "clickhouse",
             "stored-elia-imbalance",
-            source.event_id,
+            f"{source.event_id}:{source.ingested_at.isoformat()}",
             source.schema_version,
         ),
         event_type="elia.imbalance.stored",
@@ -156,6 +156,9 @@ def _stored_event(source: EventEnvelope) -> EventEnvelope:
         payload={
             "source_event_id": source.event_id,
             "timestamp": source.event_time.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "source_ingested_at": source.ingested_at.astimezone(UTC)
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     )
 

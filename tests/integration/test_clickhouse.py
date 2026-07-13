@@ -76,8 +76,14 @@ def event(
     )
 
 
-def prediction_event(*, event_id: str, target_time: datetime) -> EventEnvelope:
-    generated_at = target_time - timedelta(minutes=1) + timedelta(seconds=10)
+def prediction_event(
+    *,
+    event_id: str,
+    target_time: datetime,
+    generated_at: datetime | None = None,
+    current_state: str | None = "positive",
+) -> EventEnvelope:
+    generated_at = generated_at or target_time - timedelta(minutes=1) + timedelta(seconds=10)
     return EventEnvelope(
         event_id=event_id,
         event_type="imbalance.prediction.generated",
@@ -97,7 +103,7 @@ def prediction_event(*, event_id: str, target_time: datetime) -> EventEnvelope:
             "p90_mw": 120.0,
             "flip_probability": 0.2,
             "will_flip": False,
-            "current_state": "positive",
+            "current_state": current_state,
             "predicted_state": "positive",
             "prediction_quality": "model",
             "model_version": "model-v1",
@@ -301,6 +307,38 @@ async def test_predictions_for_a_realized_target_are_read_without_waiting_for_me
             "prediction-b",
         ]
         assert all(prediction.target_time == target for prediction in predictions)
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_prediction_revision_reads_a_single_tuple_when_latest_state_is_null() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    target = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    generated_at = target - timedelta(minutes=1) + timedelta(seconds=10)
+    try:
+        await repository.insert_event(
+            prediction_event(
+                event_id="prediction-revision",
+                target_time=target,
+                generated_at=generated_at,
+            )
+        )
+        await repository.insert_event(
+            prediction_event(
+                event_id="prediction-revision",
+                target_time=target,
+                generated_at=generated_at + timedelta(seconds=1),
+                current_state=None,
+            )
+        )
+
+        predictions = await repository.fetch_predictions_for_target(target)
+
+        assert len(predictions) == 1
+        assert predictions[0].event_id == "prediction-revision"
+        assert predictions[0].current_state is None
     finally:
         await repository.aclose()
 

@@ -29,10 +29,13 @@ class _StoredImbalancePayload(BaseModel):
 
     source_event_id: str
     timestamp: datetime
+    source_ingested_at: datetime | None = None
 
-    @field_validator("timestamp")
+    @field_validator("timestamp", "source_ingested_at")
     @classmethod
-    def require_utc(cls, value: datetime) -> datetime:
+    def require_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
             raise ValueError("stored imbalance timestamp must be UTC-aware")
         return value.astimezone(UTC)
@@ -45,11 +48,12 @@ class FeatureService:
 
     async def handle(self, message: Message) -> None:
         try:
-            snapshot = await self._build_snapshot(message.event)
+            _stored_payload(message.event)
         except (TypeError, ValidationError, ValueError):
             await self._reject(message, _invalid_reason(message.event))
             return
         try:
+            snapshot = await self._build_snapshot(message.event)
             await self._bus.publish(
                 Subject.FEATURES_IMBALANCE.value,
                 _feature_event(message.event, snapshot),
@@ -64,7 +68,6 @@ class FeatureService:
             await self.handle(message)
 
     async def _build_snapshot(self, event: EventEnvelope) -> FeatureSnapshot:
-        _stored_payload(event)
         return await self._engine.build(event.event_time, knowledge_cutoff=event.ingested_at)
 
     async def _reject(self, message: Message, reason: DeadLetterReason) -> None:
@@ -108,6 +111,8 @@ def _stored_payload(event: EventEnvelope) -> _StoredImbalancePayload:
     payload = _StoredImbalancePayload.model_validate(event.payload)
     if payload.timestamp != event.event_time:
         raise ValueError("stored imbalance timestamp does not match event time")
+    if payload.source_ingested_at is not None and payload.source_ingested_at != event.ingested_at:
+        raise ValueError("stored imbalance source version does not match envelope")
     return payload
 
 
@@ -159,6 +164,7 @@ def _array_list(values: object) -> object:
 
 async def _run_service() -> None:
     from imbalance_pipeline.features.engine import FeatureEngine
+    from imbalance_pipeline.features.schema import FeatureRegistry
     from imbalance_pipeline.messaging.nats import NatsEventBus
 
     settings = get_settings()
@@ -167,7 +173,8 @@ async def _run_service() -> None:
         repository = await ClickHouseRepository.connect(settings)
         try:
             await bus.ensure_grid_stream()
-            await FeatureService(FeatureEngine(repository), cast(EventBus, bus)).run()
+            registry = FeatureRegistry.default(deadband_mw=settings.flip_deadband_mw)
+            await FeatureService(FeatureEngine(repository, registry), cast(EventBus, bus)).run()
         finally:
             await repository.aclose()
     finally:

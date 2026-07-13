@@ -481,7 +481,7 @@ async def test_fetch_predictions_for_target_returns_each_canonical_prediction() 
     assert predictions[1].will_flip is True
     query, parameters, settings = client.queries[0]
     assert "GROUP BY event_id" in query
-    assert "argMax" in query
+    assert "argMax(tuple(" in "".join(query.split())
     assert "FINAL" not in query.upper()
     assert parameters == {"target_time": target}
     assert settings["tz_mode"] == "aware"
@@ -841,6 +841,7 @@ async def test_sink_inserts_then_publishes_deterministic_stored_trigger_then_ack
     assert stored.payload == {
         "source_event_id": source.event_id,
         "timestamp": "2026-07-13T10:01:00Z",
+        "source_ingested_at": "2026-07-13T10:01:05Z",
     }
 
     replay = RecordingMessage(source, trace)
@@ -849,6 +850,15 @@ async def test_sink_inserts_then_publishes_deterministic_stored_trigger_then_ack
     assert bus.published[1][1].event_id == stored.event_id
     assert bus.published[1][1] == stored
     assert replay.acked is True
+
+    correction = source.model_copy(
+        update={"ingested_at": source.ingested_at + timedelta(seconds=1)}
+    )
+    await Sink(repository, bus).handle(RecordingMessage(correction, trace))
+
+    corrected = bus.published[2][1]
+    assert corrected.event_id != stored.event_id
+    assert corrected.payload["source_ingested_at"] == "2026-07-13T10:01:06Z"
 
 
 @pytest.mark.asyncio

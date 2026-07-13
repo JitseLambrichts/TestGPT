@@ -48,12 +48,14 @@ class RecordingMessage:
 
 
 class FakeFeatureEngine:
-    def __init__(self, result: FeatureSnapshot) -> None:
+    def __init__(self, result: FeatureSnapshot | Exception) -> None:
         self.result = result
         self.calls: list[tuple[datetime, datetime]] = []
 
     async def build(self, event_cutoff: datetime, *, knowledge_cutoff: datetime) -> FeatureSnapshot:
         self.calls.append((event_cutoff, knowledge_cutoff))
+        if isinstance(self.result, Exception):
+            raise self.result
         return self.result
 
 
@@ -72,6 +74,7 @@ def stored_event() -> EventEnvelope:
         payload={
             "source_event_id": "source-event-001",
             "timestamp": NOW.isoformat().replace("+00:00", "Z"),
+            "source_ingested_at": NOW.isoformat().replace("+00:00", "Z"),
         },
     )
 
@@ -139,6 +142,20 @@ async def test_feature_service_dead_letters_an_invalid_stored_trigger() -> None:
     assert engine.calls == []
     assert trace == [("publish", FEATURE_DLQ_SUBJECT), ("ack", "stored-event-001")]
     assert bus.published[0][1].payload["reason"] == "unsupported_event_type"
+
+
+@pytest.mark.asyncio
+async def test_feature_service_naks_a_retryable_feature_engine_failure() -> None:
+    trace: list[tuple[str, object]] = []
+    engine = FakeFeatureEngine(RuntimeError("ClickHouse temporarily unavailable"))
+    bus = RecordingBus(trace)
+    message = RecordingMessage(stored_event(), trace)
+
+    await FeatureService(engine, bus).handle(message)
+
+    assert engine.calls == [(NOW, NOW)]
+    assert trace == [("nak", 5.0)]
+    assert bus.published == []
 
 
 def test_feature_test_doubles_match_transport_protocols() -> None:
