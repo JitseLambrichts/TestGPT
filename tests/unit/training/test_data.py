@@ -4,7 +4,11 @@ import numpy as np
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.features.engine import FeatureSnapshot
-from imbalance_pipeline.training.data import RobustPreprocessor, build_training_examples
+from imbalance_pipeline.training.data import (
+    RobustPreprocessor,
+    build_training_examples,
+    preprocess_training_examples,
+)
 
 NOW = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
 
@@ -97,3 +101,29 @@ def test_preprocessing_is_train_only_and_preserves_missing_zeros() -> None:
     assert transformed.local_values[1, 1] == 0.0
     np.testing.assert_array_equal(transformed.local_masks, held_out.local_masks)
     np.testing.assert_allclose(restored.transform(held_out).local_values, transformed.local_values)
+
+
+def test_preprocess_training_examples_uses_fitted_statistics_without_changing_labels() -> None:
+    train_example = build_training_examples(
+        [snapshot(current_state=ConfirmedState.POSITIVE)],
+        targets(12.0),
+    )[0]
+    held_out_example = build_training_examples(
+        [
+            snapshot(
+                cutoff=NOW + timedelta(minutes=1),
+                current_state=ConfirmedState.POSITIVE,
+                local_values=np.asarray([[100.0, 2.0], [300.0, 4.0]], dtype=np.float32),
+            )
+        ],
+        {NOW + timedelta(minutes=2): 400.0},
+    )[0]
+
+    transformed = preprocess_training_examples(
+        [held_out_example],
+        RobustPreprocessor.fit([train_example]),
+    )[0]
+
+    assert transformed.target_next == held_out_example.target_next
+    assert transformed.flip_target == held_out_example.flip_target
+    assert transformed.local_values[-1, 0] == 12.0

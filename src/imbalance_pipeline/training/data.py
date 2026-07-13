@@ -1,6 +1,6 @@
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -241,6 +241,43 @@ class RobustPreprocessor:
             static_location=static[1],
             static_scale=static[2],
         )
+
+
+def preprocess_training_examples(
+    examples: Sequence[TrainingExample],
+    preprocessor: RobustPreprocessor,
+) -> list[TrainingExample]:
+    transformed: list[TrainingExample] = []
+    for example in examples:
+        if example.feature_schema_hash != preprocessor.feature_schema_hash:
+            raise ValueError("feature schema hash does not match fitted preprocessing")
+        transformed.append(
+            replace(
+                example,
+                local_values=_transform(
+                    example.local_values,
+                    example.local_masks,
+                    preprocessor.local_location,
+                    preprocessor.local_scale,
+                ),
+                local_masks=_binary_masks(example.local_masks),
+                context_values=_transform(
+                    example.context_values,
+                    example.context_masks,
+                    preprocessor.context_location,
+                    preprocessor.context_scale,
+                ),
+                context_masks=_binary_masks(example.context_masks),
+                static_values=_transform(
+                    example.static_values,
+                    example.static_masks,
+                    preprocessor.static_location,
+                    preprocessor.static_scale,
+                ),
+                static_masks=_binary_masks(example.static_masks),
+            )
+        )
+    return transformed
 
 
 def build_training_examples(
