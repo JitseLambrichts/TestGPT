@@ -16,6 +16,7 @@ from nats.js.api import (
 from nats.js.client import JetStreamContext
 from nats.js.errors import NotFoundError
 
+import imbalance_pipeline.messaging.nats as nats_adapter
 from imbalance_pipeline.config import Settings
 from imbalance_pipeline.domain.events import EventEnvelope
 from imbalance_pipeline.messaging.nats import NatsEventBus
@@ -109,8 +110,18 @@ async def test_duplicate_publish_is_consumed_once_and_ack_survives_reconnect() -
         await admin.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "drift"),
+    [
+        ("max_deliver", {"max_deliver": 4, "backoff": [1, 5, 30]}),
+        ("headers_only", {"headers_only": True}),
+    ],
+)
 @pytest.mark.asyncio
-async def test_existing_durable_policy_conflict_is_rejected_before_binding() -> None:
+async def test_existing_durable_policy_conflict_is_rejected_before_binding(
+    field: str,
+    drift: dict[str, object],
+) -> None:
     assert NATS_URL is not None
     identity = uuid4().hex
     subject = f"grid.integration.conflict.{identity}"
@@ -121,22 +132,20 @@ async def test_existing_durable_policy_conflict_is_rejected_before_binding() -> 
     try:
         bus = await NatsEventBus.connect(Settings(nats_url=NATS_URL))
         await bus.ensure_grid_stream()
-        await admin_js.add_consumer(
-            "GRID_EVENTS",
-            config=ConsumerConfig(
-                name=durable,
-                durable_name=durable,
-                deliver_policy=DeliverPolicy.ALL,
-                ack_policy=AckPolicy.EXPLICIT,
-                max_deliver=4,
-                backoff=[1, 5, 30],
-                filter_subject=subject,
-                replay_policy=ReplayPolicy.INSTANT,
-            ),
+        config = ConsumerConfig(
+            name=durable,
+            durable_name=durable,
+            deliver_policy=DeliverPolicy.ALL,
+            ack_policy=AckPolicy.EXPLICIT,
+            max_deliver=5,
+            backoff=[1, 5, 30, 120],
+            filter_subject=subject,
+            replay_policy=ReplayPolicy.INSTANT,
         )
+        await admin_js.add_consumer("GRID_EVENTS", config=config.evolve(**drift))
 
         messages = bus.messages(subject, durable)
-        with pytest.raises(RuntimeError, match="max_deliver"):
+        with pytest.raises(nats_adapter.ConsumerConfigConflict, match=field):
             await asyncio.wait_for(anext(messages), timeout=2)
     finally:
         if bus is not None:

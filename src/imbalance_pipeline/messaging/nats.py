@@ -26,6 +26,10 @@ CONSUMER_MAX_DELIVER: Final = 5
 FETCH_TIMEOUT_SECONDS: Final = 1.0
 
 
+class ConsumerConfigConflict(RuntimeError):
+    """A durable consumer exists with configuration this service cannot use safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class NatsMessage:
     _raw: Msg
@@ -136,6 +140,7 @@ class NatsEventBus:
 
     async def messages(self, subject: str, durable: str) -> AsyncIterator[NatsMessage]:
         subscription: JetStreamContext.PullSubscription | None = None
+        unregistered_subscription = False
         primary_error: BaseException | None = None
         try:
             async with self._lifecycle_lock:
@@ -155,19 +160,19 @@ class NatsEventBus:
                         stream=GRID_STREAM,
                         config=config,
                     )
+                    unregistered_subscription = True
                 else:
                     if self._shutdown_requested.is_set():
                         return
-                    conflicts = _consumer_policy_conflicts(info.config, config)
-                    if conflicts:
-                        fields = ", ".join(conflicts)
-                        raise RuntimeError(
-                            f"durable consumer {durable!r} conflicts with managed fields: {fields}"
-                        )
+                    _validate_consumer_policy(info.config, config, durable)
                     subscription = await self._jetstream.pull_subscribe_bind(
                         consumer=durable,
                         stream=GRID_STREAM,
                     )
+                    unregistered_subscription = True
+
+                actual = await self._jetstream.consumer_info(GRID_STREAM, durable)
+                _validate_consumer_policy(actual.config, config, durable)
             except (BadSubscriptionError, ConnectionClosedError):
                 if self._shutdown_requested.is_set():
                     return
@@ -177,12 +182,8 @@ class NatsEventBus:
                 close_after_setup = self._shutdown_requested.is_set()
                 if not close_after_setup:
                     self._subscriptions.add(subscription)
+                    unregistered_subscription = False
             if close_after_setup:
-                try:
-                    await subscription.unsubscribe()
-                except (BadSubscriptionError, ConnectionClosedError):
-                    if not self._shutdown_requested.is_set():
-                        raise
                 return
 
             while not self._shutdown_requested.is_set():
@@ -205,7 +206,7 @@ class NatsEventBus:
             primary_error = exc
             raise
         finally:
-            cleanup = False
+            cleanup = unregistered_subscription
             if subscription is not None:
                 async with self._lifecycle_lock:
                     if subscription in self._subscriptions:
@@ -313,7 +314,22 @@ def _consumer_policy_conflicts(
             conflicts.append(field_name)
     if tuple(existing.backoff or ()) != tuple(desired.backoff or ()):
         conflicts.append("backoff")
+    if bool(existing.headers_only) != bool(desired.headers_only):
+        conflicts.append("headers_only")
     return conflicts
+
+
+def _validate_consumer_policy(
+    existing: api.ConsumerConfig,
+    desired: api.ConsumerConfig,
+    durable: str,
+) -> None:
+    conflicts = _consumer_policy_conflicts(existing, desired)
+    if conflicts:
+        fields = ", ".join(conflicts)
+        raise ConsumerConfigConflict(
+            f"durable consumer {durable!r} conflicts with managed fields: {fields}"
+        )
 
 
 def _tightens_max_age(existing_max_age: float | None) -> bool:

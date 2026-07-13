@@ -218,11 +218,13 @@ class FakeJetStream:
         existing_stream: StreamInfo | None = None,
         oldest_message: RawStreamMsg | None = None,
         consumers: dict[str, ConsumerInfo] | None = None,
+        consumer_info_results: list[ConsumerInfo | BaseException] | None = None,
         subscription: FakePullSubscription | None = None,
     ) -> None:
         self.existing_stream = existing_stream
         self.oldest_message = oldest_message
         self.consumers = dict(consumers or {})
+        self.consumer_info_results = deque(consumer_info_results or [])
         self.subscription = subscription or FakePullSubscription()
         self.stream_info_requests: list[str] = []
         self.get_msg_requests: list[tuple[str, int | None]] = []
@@ -230,6 +232,7 @@ class FakeJetStream:
         self.added_streams: list[StreamConfig] = []
         self.updated_streams: list[StreamConfig] = []
         self.deleted_streams: list[str] = []
+        self.deleted_consumers: list[tuple[str, str]] = []
         self.published: list[Published] = []
         self.pull_requests: list[PullRequest] = []
         self.bind_requests: list[BindRequest] = []
@@ -286,9 +289,19 @@ class FakeJetStream:
 
     async def consumer_info(self, stream: str, consumer: str) -> ConsumerInfo:
         self.consumer_info_requests.append((stream, consumer))
+        if self.consumer_info_results:
+            result = self.consumer_info_results.popleft()
+            if isinstance(result, BaseException):
+                raise result
+            return result
         if consumer not in self.consumers:
             raise NotFoundError(code=404, description="consumer not found")
         return self.consumers[consumer]
+
+    async def delete_consumer(self, stream: str, consumer: str) -> bool:
+        self.deleted_consumers.append((stream, consumer))
+        self.consumers.pop(consumer, None)
+        return True
 
     async def pull_subscribe(
         self,
@@ -676,17 +689,23 @@ async def test_messages_configures_durable_pull_delivery_and_exposes_ack_metadat
     await message.ack()
     await messages.aclose()
 
-    assert jetstream.consumer_info_requests == [("GRID_EVENTS", "clickhouse-sink")]
+    assert jetstream.consumer_info_requests == [
+        ("GRID_EVENTS", "clickhouse-sink"),
+        ("GRID_EVENTS", "clickhouse-sink"),
+    ]
     assert raw_client.frames == [AckFrame(ACK_REPLY, b"", "", None)]
     assert subscription.unsubscribe_count == 1
 
 
+@pytest.mark.parametrize("headers_only", [None, False])
 @pytest.mark.asyncio
-async def test_messages_binds_an_existing_compatible_durable_without_recreating_it() -> None:
+async def test_messages_binds_an_existing_compatible_durable_without_recreating_it(
+    headers_only: bool | None,
+) -> None:
     event = complete_event()
     raw_client = FakeRawNatsClient()
     subscription = FakePullSubscription([raw_message(event, raw_client)])
-    existing = consumer_info(managed_consumer_config())
+    existing = consumer_info(managed_consumer_config().evolve(headers_only=headers_only))
     jetstream = FakeJetStream(
         consumers={"clickhouse-sink": existing},
         subscription=subscription,
@@ -698,7 +717,10 @@ async def test_messages_binds_an_existing_compatible_durable_without_recreating_
     await messages.aclose()
 
     assert message.event == event
-    assert jetstream.consumer_info_requests == [("GRID_EVENTS", "clickhouse-sink")]
+    assert jetstream.consumer_info_requests == [
+        ("GRID_EVENTS", "clickhouse-sink"),
+        ("GRID_EVENTS", "clickhouse-sink"),
+    ]
     assert jetstream.pull_requests == []
     assert jetstream.bind_requests == [BindRequest("clickhouse-sink", "GRID_EVENTS")]
 
@@ -713,6 +735,7 @@ async def test_messages_binds_an_existing_compatible_durable_without_recreating_
         ("deliver_policy", DeliverPolicy.NEW),
         ("replay_policy", ReplayPolicy.ORIGINAL),
         ("deliver_subject", "_INBOX.existing-push-consumer"),
+        ("headers_only", True),
     ],
 )
 @pytest.mark.asyncio
@@ -731,12 +754,42 @@ async def test_messages_rejects_existing_durable_policy_drift_before_binding(
     bus, _ = make_bus(jetstream)
     messages = bus.messages(GRID_SUBJECT, durable="clickhouse-sink")
 
-    with pytest.raises(RuntimeError, match=field):
+    with pytest.raises(nats_adapter.ConsumerConfigConflict, match=field):
         await anext(messages)
 
     assert jetstream.pull_requests == []
     assert jetstream.bind_requests == []
     assert subscription.fetches == []
+
+
+@pytest.mark.asyncio
+async def test_messages_rejects_a_conflicting_durable_created_during_subscription_setup() -> None:
+    event = complete_event()
+    raw_client = FakeRawNatsClient()
+    subscription = FakePullSubscription([raw_message(event, raw_client)])
+    conflict = consumer_info(managed_consumer_config().evolve(max_deliver=4))
+    jetstream = FakeJetStream(
+        consumer_info_results=[
+            NotFoundError(code=404, description="consumer not found"),
+            conflict,
+        ],
+        subscription=subscription,
+    )
+    bus, _ = make_bus(jetstream)
+    messages = bus.messages(GRID_SUBJECT, durable="clickhouse-sink")
+
+    with pytest.raises(nats_adapter.ConsumerConfigConflict, match="max_deliver"):
+        await anext(messages)
+
+    assert jetstream.consumer_info_requests == [
+        ("GRID_EVENTS", "clickhouse-sink"),
+        ("GRID_EVENTS", "clickhouse-sink"),
+    ]
+    assert len(jetstream.pull_requests) == 1
+    assert jetstream.bind_requests == []
+    assert subscription.fetches == []
+    assert subscription.unsubscribe_count == 1
+    assert jetstream.deleted_consumers == []
 
 
 @pytest.mark.asyncio
