@@ -1,0 +1,88 @@
+{
+  "total_count": 1095,
+  "results": [
+    {
+      "datetime": "2026-07-13T18:14:00+02:00",
+      "resolutioncode": "PT1M",
+      "quarterhour": "2026-07-13T18:00:00+02:00",
+      "qualitystatus": "Non-validated",
+      "ace": -118.511,
+      "systemimbalance": 325.224,
+      "alpha": 4.032,
+      "alpha_prime": null,
+      "marginalincrementalprice": 152.96,
+      "marginaldecrementalprice": 117.242,
+      "imbalanceprice": null
+    },
+    {
+      "datetime": "2026-07-13T16:13:00+00:00",
+      "resolutioncode": "PT1M",
+      "quarterhour": "2026-07-13T16:00:00+00:00",
+      "qualitystatus": "DataIssue",
+      "ace": 1.806,
+      "systemimbalance": 210.418,
+      "alpha": 3.618,
+      "alpha_prime": 0.0,
+      "marginalincrementalprice": 152.96,
+      "marginaldecrementalprice": 117.242,
+      "imbalanceprice": 113.624
+    }
+  ],
+  "supporting": {
+    "ods002": {
+      "datetime": "2026-07-17T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "measured": null,
+      "mostrecentforecast": 8597.61,
+      "mostrecentconfidence10": 7845.65,
+      "mostrecentconfidence90": 9349.57,
+      "dayaheadforecast": 8597.61,
+      "dayaheadconfidence10": 7845.65,
+      "dayaheadconfidence90": 9349.57,
+      "weekaheadforecast": 8714.32
+    },
+    "ods086": {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "offshoreonshore": "Onshore",
+      "region": "Flanders",
+      "gridconnectiontype": "Elia",
+      "realtime": null,
+      "mostrecentforecast": 37.0,
+      "mostrecentconfidence10": 11.9,
+      "mostrecentconfidence90": 119.1,
+      "dayahead11hforecast": 37.0,
+      "dayahead11hconfidence10": 11.9,
+      "dayahead11hconfidence90": 119.1,
+      "dayaheadforecast": 37.0,
+      "dayaheadconfidence10": 11.9,
+      "dayaheadconfidence90": 119.1,
+      "weekaheadforecast": 39.9,
+      "weekaheadconfidence10": 10.4,
+      "weekaheadconfidence90": 128.2,
+      "monitoredcapacity": 333.4,
+      "loadfactor": null,
+      "decrementalbidid": null
+    },
+    "ods087": {
+      "datetime": "2026-07-19T21:45:00+00:00",
+      "resolutioncode": "PT15M",
+      "region": "Namur",
+      "realtime": null,
+      "mostrecentforecast": 0.0,
+      "mostrecentconfidence10": 0.0,
+      "mostrecentconfidence90": 0.0,
+      "dayahead11hforecast": 0.0,
+      "dayahead11hconfidence10": 0.0,
+      "dayahead11hconfidence90": 0.0,
+      "dayaheadforecast": 0.0,
+      "dayaheadconfidence10": 0.0,
+      "dayaheadconfidence90": 0.0,
+      "weekaheadforecast": 0.0,
+      "weekaheadconfidence10": 0.0,
+      "weekaheadconfidence90": 0.0,
+      "loadfactor": 0.0,
+      "monitoredcapacity": 444.557
+    }
+  }
+}
