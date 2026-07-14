@@ -733,6 +733,95 @@ class ClickHouseRepository:
             values[field_name] = _clickhouse_utc(cast(datetime, values[field_name]))
         return Prediction.model_validate(values)
 
+    async def list_predictions(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+        after_target_time: datetime | None,
+        after_event_id: str | None,
+    ) -> list[Prediction]:
+        start = _clickhouse_utc(start)
+        end = _clickhouse_utc(end)
+        if end < start:
+            raise ValueError("prediction range end cannot precede start")
+        if limit <= 0 or limit > 10_001:
+            raise ValueError("prediction range limit must be between 1 and 10001")
+        if (after_target_time is None) != (after_event_id is None):
+            raise ValueError("prediction keyset cursor requires both timestamp and event id")
+        parameters: dict[str, object] = {"start": start, "end": end, "limit": limit}
+        cursor_clause = ""
+        if after_target_time is not None:
+            parameters["after_target_time"] = _clickhouse_utc(after_target_time)
+            parameters["after_event_id"] = after_event_id
+            cursor_clause = """
+                AND tuple(target_time, event_id) > (
+                    {after_target_time:DateTime64(3, 'UTC')},
+                    {after_event_id:String}
+                )
+            """
+        query = f"""
+            WITH canonical AS (
+                SELECT
+                    event_id,
+                    argMax(
+                        tuple(
+                            cutoff,
+                            target_time,
+                            generated_at,
+                            system_imbalance_mw,
+                            p10_mw,
+                            p90_mw,
+                            flip_probability,
+                            will_flip,
+                            current_state,
+                            predicted_state,
+                            prediction_quality,
+                            model_version,
+                            feature_schema_hash
+                        ),
+                        tuple(row_version, generated_at, event_id)
+                    ) AS versioned
+                FROM {self._database}.predictions
+                WHERE target_time >= {{start:DateTime64(3, 'UTC')}}
+                  AND target_time <= {{end:DateTime64(3, 'UTC')}}
+                GROUP BY event_id
+            )
+            SELECT
+                event_id,
+                tupleElement(versioned, 1) AS cutoff,
+                tupleElement(versioned, 2) AS target_time,
+                tupleElement(versioned, 3) AS generated_at,
+                tupleElement(versioned, 4) AS system_imbalance_mw,
+                tupleElement(versioned, 5) AS p10_mw,
+                tupleElement(versioned, 6) AS p90_mw,
+                tupleElement(versioned, 7) AS flip_probability,
+                tupleElement(versioned, 8) AS will_flip,
+                tupleElement(versioned, 9) AS current_state,
+                tupleElement(versioned, 10) AS predicted_state,
+                tupleElement(versioned, 11) AS prediction_quality,
+                tupleElement(versioned, 12) AS model_version,
+                tupleElement(versioned, 13) AS feature_schema_hash
+            FROM canonical
+            WHERE target_time >= {{start:DateTime64(3, 'UTC')}}
+              AND target_time <= {{end:DateTime64(3, 'UTC')}}
+              {cursor_clause}
+            ORDER BY target_time, event_id
+            LIMIT {{limit:UInt32}}
+        """
+        try:
+            result = await self._client.query(query, parameters=parameters, tz_mode="aware")
+        except (ClickHouseError, OSError, TimeoutError) as exc:
+            raise TransientStorageError from exc
+        predictions: list[Prediction] = []
+        for row in result.result_rows:
+            values = dict(zip(PREDICTION_COLUMNS[:-1], row, strict=True))
+            for field_name in ("cutoff", "target_time", "generated_at"):
+                values[field_name] = _clickhouse_utc(cast(datetime, values[field_name]))
+            predictions.append(Prediction.model_validate(values))
+        return predictions
+
     async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]:
         target = _clickhouse_utc(target_time)
         query = f"""

@@ -521,6 +521,54 @@ async def test_fetch_predictions_for_target_returns_each_canonical_prediction() 
 
 
 @pytest.mark.asyncio
+async def test_list_predictions_uses_bounded_target_time_event_id_keyset() -> None:
+    client = RecordingClickHouseClient()
+    client.query_rows = [
+        (
+            "prediction-event-001",
+            datetime(2026, 7, 13, 10, 1),
+            datetime(2026, 7, 13, 10, 2),
+            datetime(2026, 7, 13, 10, 1, 7),
+            120.0,
+            80.0,
+            160.0,
+            0.25,
+            0,
+            "positive",
+            "positive",
+            "model",
+            "model-v1",
+            "feature-schema-001",
+        )
+    ]
+    start = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    end = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
+    cursor = datetime(2026, 7, 13, 10, 1, tzinfo=UTC)
+
+    predictions = await repository_with(client).list_predictions(
+        start=start,
+        end=end,
+        limit=2,
+        after_target_time=cursor,
+        after_event_id="previous-event",
+    )
+
+    assert [prediction.event_id for prediction in predictions] == ["prediction-event-001"]
+    query, parameters, settings = client.queries[0]
+    assert "target_time >= {start:DateTime64(3, 'UTC')}" in query
+    assert "tuple(target_time, event_id) >" in query
+    assert "LIMIT {limit:UInt32}" in query
+    assert parameters == {
+        "after_event_id": "previous-event",
+        "after_target_time": cursor,
+        "end": end,
+        "limit": 2,
+        "start": start,
+    }
+    assert settings["tz_mode"] == "aware"
+
+
+@pytest.mark.asyncio
 async def test_repository_validates_then_inserts_exact_raw_envelope_before_normalized_row() -> None:
     client = RecordingClickHouseClient()
     repository = repository_with(client)
