@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -20,17 +21,26 @@ from imbalance_pipeline.model.distribution import gaussian_mixture_quantile
 from imbalance_pipeline.model.export_onnx import OUTPUT_NAMES, export_member
 from imbalance_pipeline.model.losses import MultiTaskLoss
 from imbalance_pipeline.model.network import ImbalanceForecaster
-from imbalance_pipeline.training.baselines import classical_baseline, persistence_baseline
+from imbalance_pipeline.training.baselines import (
+    classical_baseline,
+    clipped_linear_drift_baseline,
+    persistence_baseline,
+    rolling_median_baseline,
+)
 from imbalance_pipeline.training.calibration import IsotonicCalibrator
 from imbalance_pipeline.training.data import (
     RobustPreprocessor,
     TrainingBatch,
     TrainingExample,
-    preprocess_training_examples,
 )
-from imbalance_pipeline.training.export_data import load_training_dataset
+from imbalance_pipeline.training.export_data import TrainingDataset, open_training_dataset
 from imbalance_pipeline.training.metrics import EvaluationReport, evaluate_predictions
-from imbalance_pipeline.training.splits import TimeSplit, walk_forward_splits
+from imbalance_pipeline.training.splits import (
+    IndexRange,
+    TimeSplit,
+    latest_purged_split,
+    validate_time_split,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,7 @@ class TrainingConfig:
     deadband_mw: float = 10.0
     device: str | None = None
     mixed_precision: bool = True
+    deterministic: bool = True
     split: TimeSplit | None = None
 
     def __post_init__(self) -> None:
@@ -93,6 +104,35 @@ class _EnsemblePredictions:
     p10_mw: NDArray[np.float64]
     p90_mw: NDArray[np.float64]
     raw_flip_probability: NDArray[np.float64]
+    actual_mw: NDArray[np.float64]
+    flip_target: NDArray[np.int64]
+    flip_mask: NDArray[np.bool_]
+    current_state: NDArray[np.int64]
+    volatility: NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
+class _Partition:
+    dataset: TrainingDataset
+    section: IndexRange
+
+    @property
+    def count(self) -> int:
+        return self.section.stop - self.section.start
+
+    def sample(self) -> TrainingExample:
+        return self.dataset.example_at(self.section.start)
+
+    def examples(self) -> Iterator[TrainingExample]:
+        return self.dataset.iter_range(self.section)
+
+    def batches(
+        self,
+        batch_size: int,
+        *,
+        seed: int | None = None,
+    ) -> Iterator[list[TrainingExample]]:
+        return self.dataset.iter_batches(self.section, batch_size=batch_size, seed=seed)
 
 
 def train_ensemble(
@@ -101,33 +141,37 @@ def train_ensemble(
     config: TrainingConfig | None = None,
 ) -> Path:
     config = config or TrainingConfig()
-    examples = sorted(load_training_dataset(dataset_path), key=lambda example: example.cutoff)
-    _require_unique_cutoffs(examples)
-    split = config.split or walk_forward_splits(
-        [example.cutoff for example in examples],
-        folds=1,
-    )[-1]
-    train_raw, validation_raw, calibration_raw, test_raw = _partitions(examples, split)
-    preprocessor = RobustPreprocessor.fit(train_raw)
-    train_examples = preprocess_training_examples(train_raw, preprocessor)
-    validation_examples = preprocess_training_examples(validation_raw, preprocessor)
-    calibration_examples = preprocess_training_examples(calibration_raw, preprocessor)
-    test_examples = preprocess_training_examples(test_raw, preprocessor)
+    dataset = open_training_dataset(dataset_path)
+    timestamps = dataset.cutoffs()
+    _require_unique_timestamps(timestamps)
+    split = _resolve_split(timestamps, config)
+    training = _Partition(dataset, split.train)
+    validation = _Partition(dataset, split.validation)
+    calibration = _Partition(dataset, split.calibration)
+    test = _Partition(dataset, split.test)
+    preprocessor = RobustPreprocessor.fit_stream(training.examples())
     device = _device(config.device)
     results = tuple(
-        _train_member(seed, train_examples, validation_examples, config, device)
+        _train_member(seed, training, validation, preprocessor, config, device)
         for seed in config.seeds
     )
     calibration_prediction = _ensemble_predictions(
         results,
-        calibration_examples,
+        calibration,
+        preprocessor,
         config.batch_size,
         device,
     )
-    calibrator = _fit_calibrator(calibration_prediction.raw_flip_probability, calibration_raw)
-    test_prediction = _ensemble_predictions(results, test_examples, config.batch_size, device)
-    candidate_report = _evaluation_report(test_prediction, test_raw, calibrator)
-    baseline_reports = _baseline_reports(train_raw, test_raw)
+    calibrator = _fit_calibrator(calibration_prediction)
+    test_prediction = _ensemble_predictions(
+        results,
+        test,
+        preprocessor,
+        config.batch_size,
+        device,
+    )
+    candidate_report = _evaluation_report(test_prediction, calibrator)
+    baseline_reports = _baseline_reports(training, test, test_prediction)
     return _write_candidate(
         output_dir,
         results,
@@ -135,26 +179,30 @@ def train_ensemble(
         calibrator,
         candidate_report,
         baseline_reports,
-        train_examples,
-        train_raw,
-        test_raw,
+        training,
+        validation,
+        calibration,
+        test,
+        split,
+        device,
         config,
     )
 
 
 def _train_member(
     seed: int,
-    training: Sequence[TrainingExample],
-    validation: Sequence[TrainingExample],
+    training: _Partition,
+    validation: _Partition,
+    preprocessor: RobustPreprocessor,
     config: TrainingConfig,
     device: torch.device,
 ) -> _MemberResult:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    _seed_everything(seed, device, deterministic=config.deterministic)
+    sample = training.sample()
     model = ImbalanceForecaster(
-        local_features=training[0].local_values.shape[-1],
-        context_features=training[0].context_values.shape[-1],
-        static_features=training[0].static_values.shape[-1],
+        local_features=sample.local_values.shape[-1],
+        context_features=sample.context_values.shape[-1],
+        static_features=sample.static_values.shape[-1],
         d_model=config.d_model,
         tcn_blocks=config.tcn_blocks,
         transformer_layers=config.transformer_layers,
@@ -167,8 +215,12 @@ def _train_member(
         weight_decay=config.weight_decay,
     )
     loss = MultiTaskLoss(
-        positive_weight=_positive_weight(training),
+        positive_weight=_positive_weight(training.examples()),
         deadband_mw=config.deadband_mw,
+    )
+    scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=config.mixed_precision and device.type == "cuda",
     )
     best_loss = math.inf
     best_state: dict[str, Tensor] | None = None
@@ -177,18 +229,29 @@ def _train_member(
     for epoch in range(config.epochs):
         _set_learning_rate(optimizer, config, epoch)
         model.train()
-        for examples in _batches(training, config.batch_size, seed + epoch):
-            batch = TrainingBatch.from_examples(
+        for examples in training.batches(config.batch_size, seed=seed + epoch):
+            batch = _prepared_batch(
                 examples,
+                preprocessor,
                 batch_id=f"seed-{seed}-epoch-{epoch}",
-            ).to(device)
+                device=device,
+            )
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, config.mixed_precision):
                 breakdown = loss(model(*_model_inputs(batch)), batch)
-            breakdown.total.backward()
+            scaler.scale(breakdown.total).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
-            optimizer.step()
-        validation_loss = _validation_loss(model, validation, loss, config.batch_size, device)
+            scaler.step(optimizer)
+            scaler.update()
+        validation_loss = _validation_loss(
+            model,
+            validation,
+            preprocessor,
+            loss,
+            config.batch_size,
+            device,
+        )
         completed_epochs = epoch + 1
         if validation_loss < best_loss:
             best_loss = validation_loss
@@ -213,26 +276,35 @@ def _train_member(
 
 def _validation_loss(
     model: ImbalanceForecaster,
-    examples: Sequence[TrainingExample],
+    validation: _Partition,
+    preprocessor: RobustPreprocessor,
     loss: MultiTaskLoss,
     batch_size: int,
     device: torch.device,
 ) -> float:
     model.eval()
-    values: list[float] = []
+    nll_sum = 0.0
+    nll_count = 0
+    brier_sum = 0.0
+    brier_count = 0
     with torch.inference_mode():
-        for items in _ordered_batches(examples, batch_size):
-            batch = TrainingBatch.from_examples(items, batch_id="validation").to(device)
+        for items in validation.batches(batch_size):
+            batch = _prepared_batch(items, preprocessor, batch_id="validation", device=device)
             output = model(*_model_inputs(batch))
             breakdown = loss(output, batch)
-            brier = _masked_brier(output.flip_logit, batch.flip_target, batch.flip_mask)
-            values.append(float((breakdown.mixture_nll + 0.25 * brier).cpu()))
-    return float(np.mean(values))
+            count = len(items)
+            nll_sum += float(breakdown.mixture_nll.cpu()) * count
+            nll_count += count
+            squared_error = (torch.sigmoid(output.flip_logit) - batch.flip_target).square()
+            brier_sum += float((squared_error * batch.flip_mask).sum().cpu())
+            brier_count += int(batch.flip_mask.sum().item())
+    return _validation_objective(nll_sum, nll_count, brier_sum, brier_count)
 
 
 def _ensemble_predictions(
     results: Sequence[_MemberResult],
-    examples: Sequence[TrainingExample],
+    partition: _Partition,
+    preprocessor: RobustPreprocessor,
     batch_size: int,
     device: torch.device,
 ) -> _EnsemblePredictions:
@@ -240,11 +312,16 @@ def _ensemble_predictions(
     p10: list[NDArray[np.float64]] = []
     p90: list[NDArray[np.float64]] = []
     flip: list[NDArray[np.float64]] = []
+    actual: list[NDArray[np.float64]] = []
+    flip_target: list[NDArray[np.int64]] = []
+    flip_mask: list[NDArray[np.bool_]] = []
+    current_state: list[NDArray[np.int64]] = []
+    volatility: list[NDArray[np.float64]] = []
     for result in results:
         result.model.eval()
     with torch.inference_mode():
-        for items in _ordered_batches(examples, batch_size):
-            batch = TrainingBatch.from_examples(items, batch_id="evaluation").to(device)
+        for items in partition.batches(batch_size):
+            batch = _prepared_batch(items, preprocessor, batch_id="evaluation", device=device)
             outputs = [result.model(*_model_inputs(batch)) for result in results]
             mixture_logits = torch.cat(
                 [
@@ -293,78 +370,116 @@ def _ensemble_predictions(
             )
             mean_flip_logit = torch.stack([output.flip_logit for output in outputs]).mean(dim=0)
             flip.append(torch.sigmoid(mean_flip_logit).cpu().numpy().astype(np.float64))
+            actual.append(batch.target_next.cpu().numpy().astype(np.float64))
+            flip_target.append(batch.flip_target.cpu().numpy().astype(np.int64))
+            flip_mask.append(batch.flip_mask.cpu().numpy().astype(bool))
+            current_state.append(batch.current_state.cpu().numpy().astype(np.int64))
+            volatility.append(_volatility(items))
     return _EnsemblePredictions(
         predicted_mw=np.concatenate(point),
         p10_mw=np.concatenate(p10),
         p90_mw=np.concatenate(p90),
         raw_flip_probability=np.concatenate(flip),
+        actual_mw=np.concatenate(actual),
+        flip_target=np.concatenate(flip_target),
+        flip_mask=np.concatenate(flip_mask),
+        current_state=np.concatenate(current_state),
+        volatility=np.concatenate(volatility),
     )
 
 
 def _fit_calibrator(
-    probability: NDArray[np.float64],
-    examples: Sequence[TrainingExample],
+    prediction: _EnsemblePredictions,
 ) -> IsotonicCalibrator:
-    mask = np.asarray([example.flip_mask > 0.5 for example in examples])
+    mask = prediction.flip_mask
     if not np.any(mask):
         return IsotonicCalibrator(
             x_thresholds=np.asarray([0.0, 1.0]),
             y_thresholds=np.asarray([0.0, 0.0]),
             decision_threshold=0.5,
         )
-    target = np.asarray([example.flip_target for example in examples], dtype=np.int64)[mask]
-    return IsotonicCalibrator.fit(probability[mask], target)
+    return IsotonicCalibrator.fit(
+        prediction.raw_flip_probability[mask],
+        prediction.flip_target[mask],
+    )
 
 
 def _evaluation_report(
     prediction: _EnsemblePredictions,
-    examples: Sequence[TrainingExample],
     calibrator: IsotonicCalibrator,
 ) -> EvaluationReport:
-    mask = np.asarray([example.flip_mask > 0.5 for example in examples])
-    if not np.any(mask):
+    if not np.any(prediction.flip_mask):
         raise ValueError("test partition requires at least one known flip label")
-    calibrated = calibrator.predict(prediction.raw_flip_probability[mask])
+    calibrated = calibrator.predict(prediction.raw_flip_probability)
     return evaluate_predictions(
-        actual_mw=np.asarray([example.target_next for example in examples], dtype=np.float64)[mask],
-        predicted_mw=prediction.predicted_mw[mask],
-        p10_mw=prediction.p10_mw[mask],
-        p90_mw=prediction.p90_mw[mask],
-        flip_target=np.asarray([example.flip_target for example in examples], dtype=np.int64)[mask],
+        actual_mw=prediction.actual_mw,
+        predicted_mw=prediction.predicted_mw,
+        p10_mw=prediction.p10_mw,
+        p90_mw=prediction.p90_mw,
+        flip_target=prediction.flip_target,
         flip_probability=calibrated,
+        flip_mask=prediction.flip_mask,
         threshold=calibrator.decision_threshold,
+        cohorts=_cohort_masks(prediction),
     )
 
 
 def _baseline_reports(
-    training: Sequence[TrainingExample],
-    test: Sequence[TrainingExample],
+    training: _Partition,
+    test: _Partition,
+    evaluation: _EnsemblePredictions,
 ) -> dict[str, EvaluationReport]:
-    mask = np.asarray([example.flip_mask > 0.5 for example in test])
-    if not np.any(mask):
+    if not np.any(evaluation.flip_mask):
         raise ValueError("test partition requires at least one known flip label")
-    actual = np.asarray([example.target_next for example in test], dtype=np.float64)[mask]
-    target = np.asarray([example.flip_target for example in test], dtype=np.int64)[mask]
-    persistence = persistence_baseline(test)[mask]
-    classical = classical_baseline(training, test)
+    persistence = persistence_baseline(test.examples())
+    drift = clipped_linear_drift_baseline(test.examples())
+    rolling_median = rolling_median_baseline(test.examples())
+    classical = classical_baseline(training.examples(), test.examples())
+    cohorts = _cohort_masks(evaluation)
     return {
         "persistence": evaluate_predictions(
-            actual_mw=actual,
+            actual_mw=evaluation.actual_mw,
             predicted_mw=persistence,
             p10_mw=persistence,
             p90_mw=persistence,
-            flip_target=target,
-            flip_probability=np.zeros(len(actual), dtype=np.float64),
+            flip_target=evaluation.flip_target,
+            flip_probability=np.zeros(len(evaluation.actual_mw), dtype=np.float64),
+            flip_mask=evaluation.flip_mask,
             threshold=0.5,
+            cohorts=cohorts,
+        ),
+        "clipped_linear_drift": evaluate_predictions(
+            actual_mw=evaluation.actual_mw,
+            predicted_mw=drift,
+            p10_mw=drift,
+            p90_mw=drift,
+            flip_target=evaluation.flip_target,
+            flip_probability=np.zeros(len(evaluation.actual_mw), dtype=np.float64),
+            flip_mask=evaluation.flip_mask,
+            threshold=0.5,
+            cohorts=cohorts,
+        ),
+        "rolling_median": evaluate_predictions(
+            actual_mw=evaluation.actual_mw,
+            predicted_mw=rolling_median,
+            p10_mw=rolling_median,
+            p90_mw=rolling_median,
+            flip_target=evaluation.flip_target,
+            flip_probability=np.zeros(len(evaluation.actual_mw), dtype=np.float64),
+            flip_mask=evaluation.flip_mask,
+            threshold=0.5,
+            cohorts=cohorts,
         ),
         "classical": evaluate_predictions(
-            actual_mw=actual,
-            predicted_mw=classical.predicted_mw[mask],
-            p10_mw=classical.predicted_mw[mask],
-            p90_mw=classical.predicted_mw[mask],
-            flip_target=target,
-            flip_probability=classical.flip_probability[mask],
+            actual_mw=evaluation.actual_mw,
+            predicted_mw=classical.predicted_mw,
+            p10_mw=classical.predicted_mw,
+            p90_mw=classical.predicted_mw,
+            flip_target=evaluation.flip_target,
+            flip_probability=classical.flip_probability,
+            flip_mask=evaluation.flip_mask,
             threshold=0.5,
+            cohorts=cohorts,
         ),
     }
 
@@ -376,9 +491,12 @@ def _write_candidate(
     calibrator: IsotonicCalibrator,
     report: EvaluationReport,
     baselines: dict[str, EvaluationReport],
-    training: Sequence[TrainingExample],
-    training_raw: Sequence[TrainingExample],
-    test_raw: Sequence[TrainingExample],
+    training: _Partition,
+    validation: _Partition,
+    calibration: _Partition,
+    test: _Partition,
+    split: TimeSplit,
+    device: torch.device,
     config: TrainingConfig,
 ) -> Path:
     if output.exists():
@@ -390,7 +508,8 @@ def _write_candidate(
     staging.mkdir()
     try:
         members: list[str] = []
-        sample_batch = TrainingBatch.from_examples([training[0]], batch_id="onnx-export")
+        sample = training.sample()
+        sample_batch = TrainingBatch.from_examples([sample], batch_id="onnx-export")
         sample_inputs = _model_inputs(sample_batch)
         for index, result in enumerate(results):
             model = result.model.to("cpu").eval()
@@ -421,7 +540,10 @@ def _write_candidate(
             staging / "baseline_evaluation.json",
             {name: baseline.to_dict() for name, baseline in baselines.items()},
         )
-        _write_json(staging / "run_config.json", _config_dict(config))
+        _write_json(
+            staging / "run_config.json",
+            _config_dict(config, split, device, training, validation, calibration, test),
+        )
         artifacts = (*members, "preprocessing.json", "calibration.json", "evaluation.json")
         _write_json(
             staging / "manifest.json",
@@ -436,15 +558,15 @@ def _write_candidate(
                 "input_shapes": {
                     "context": [
                         -1,
-                        training[0].context_values.shape[0],
-                        training[0].context_values.shape[1],
+                        sample.context_values.shape[0],
+                        sample.context_values.shape[1],
                     ],
                     "local": [
                         -1,
-                        training[0].local_values.shape[0],
-                        training[0].local_values.shape[1],
+                        sample.local_values.shape[0],
+                        sample.local_values.shape[1],
                     ],
-                    "static": [-1, training[0].static_values.shape[0]],
+                    "static": [-1, sample.static_values.shape[0]],
                 },
                 "members": members,
                 "model_version": f"imbalance-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}",
@@ -453,18 +575,20 @@ def _write_candidate(
                 "calibration_file": "calibration.json",
                 "runtime": {"opset": 18, "provider": "CPUExecutionProvider"},
                 "training_period": {
-                    "end": max(example.cutoff for example in training_raw).isoformat(),
-                    "start": min(example.cutoff for example in training_raw).isoformat(),
+                    "end": training.dataset.example_at(
+                        training.section.stop - 1
+                    ).cutoff.isoformat(),
+                    "start": sample.cutoff.isoformat(),
                 },
             },
         )
         manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
-        validation = validate_bundle(
+        bundle_validation = validate_bundle(
             staging,
             expected_schema_hash=str(manifest["feature_schema_hash"]),
         )
-        if not validation.valid:
-            raise ValueError(validation.reason or "candidate bundle validation failed")
+        if not bundle_validation.valid:
+            raise ValueError(bundle_validation.reason or "candidate bundle validation failed")
         _fsync_directory(staging)
         os.replace(staging, output)
     except Exception:
@@ -473,49 +597,56 @@ def _write_candidate(
     return output
 
 
-def _partitions(
+def _positive_weight(examples: Iterator[TrainingExample]) -> float:
+    known = 0
+    positives = 0
+    for example in examples:
+        if example.flip_mask > 0.5:
+            known += 1
+            positives += int(example.flip_target > 0.5)
+    return (known - positives) / positives if positives else 1.0
+
+
+def _prepared_batch(
     examples: Sequence[TrainingExample],
-    split: TimeSplit,
-) -> tuple[
-    list[TrainingExample],
-    list[TrainingExample],
-    list[TrainingExample],
-    list[TrainingExample],
-]:
-    for section in (split.train, split.validation, split.calibration, split.test):
-        if section.stop > len(examples):
-            raise ValueError("training split is outside the dataset")
-    return (
-        list(examples[split.train.start : split.train.stop]),
-        list(examples[split.validation.start : split.validation.stop]),
-        list(examples[split.calibration.start : split.calibration.stop]),
-        list(examples[split.test.start : split.test.stop]),
-    )
+    preprocessor: RobustPreprocessor,
+    *,
+    batch_id: str,
+    device: torch.device,
+) -> TrainingBatch:
+    raw = TrainingBatch.from_examples(examples, batch_id=batch_id)
+    return preprocessor.transform_batch(raw).to(device)
 
 
-def _positive_weight(examples: Sequence[TrainingExample]) -> float:
-    labels = [example.flip_target for example in examples if example.flip_mask > 0.5]
-    positives = sum(label > 0.5 for label in labels)
-    return (len(labels) - positives) / positives if positives else 1.0
+def _validation_objective(
+    nll_sum: float,
+    nll_count: int,
+    brier_sum: float,
+    brier_count: int,
+) -> float:
+    if nll_count <= 0:
+        raise ValueError("validation requires at least one regression example")
+    nll = nll_sum / nll_count
+    brier = brier_sum / brier_count if brier_count else 0.0
+    return nll + 0.25 * brier
 
 
-def _batches(
-    examples: Sequence[TrainingExample],
-    batch_size: int,
-    seed: int,
-) -> Iterator[list[TrainingExample]]:
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(len(examples), generator=generator).tolist()
-    for start in range(0, len(indices), batch_size):
-        yield [examples[index] for index in indices[start : start + batch_size]]
+def _volatility(examples: Sequence[TrainingExample]) -> NDArray[np.float64]:
+    values: list[float] = []
+    for example in examples:
+        history = example.local_values[:, 0][example.local_masks[:, 0] == 1]
+        values.append(float(np.std(history, dtype=np.float64)) if len(history) else 0.0)
+    return np.asarray(values, dtype=np.float64)
 
 
-def _ordered_batches(
-    examples: Sequence[TrainingExample],
-    batch_size: int,
-) -> Iterator[list[TrainingExample]]:
-    for start in range(0, len(examples), batch_size):
-        yield list(examples[start : start + batch_size])
+def _cohort_masks(prediction: _EnsemblePredictions) -> dict[str, NDArray[np.bool_]]:
+    masks: dict[str, NDArray[np.bool_]] = {
+        "current_positive": prediction.current_state == 1,
+        "current_negative": prediction.current_state == -1,
+    }
+    threshold = float(np.quantile(prediction.volatility, 2.0 / 3.0))
+    masks["high_volatility"] = prediction.volatility >= threshold
+    return masks
 
 
 def _model_inputs(batch: TrainingBatch) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -526,14 +657,6 @@ def _model_inputs(batch: TrainingBatch) -> tuple[Tensor, Tensor, Tensor, Tensor,
         batch.context_mask,
         batch.static,
         batch.static_mask,
-    )
-
-
-def _masked_brier(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-    typed_mask = mask.to(logits.dtype)
-    return (
-        ((torch.sigmoid(logits) - target).square() * typed_mask).sum()
-        / typed_mask.sum().clamp_min(1.0)
     )
 
 
@@ -564,42 +687,83 @@ def _device(configured: str | None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _require_unique_cutoffs(examples: Sequence[TrainingExample]) -> None:
-    if not examples:
+def _seed_everything(seed: int, device: torch.device, *, deterministic: bool) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True)
+
+
+def _require_unique_timestamps(timestamps: Sequence[datetime]) -> None:
+    if not timestamps:
         raise ValueError("training dataset is empty")
-    cutoffs = [example.cutoff for example in examples]
-    if len(set(cutoffs)) != len(cutoffs):
+    if len(set(timestamps)) != len(timestamps):
         raise ValueError("training dataset cutoffs must be unique")
 
 
-def _config_dict(config: TrainingConfig) -> dict[str, object]:
-    value = {
+def _resolve_split(timestamps: Sequence[datetime], config: TrainingConfig) -> TimeSplit:
+    split = config.split or latest_purged_split(timestamps)
+    validate_time_split(timestamps, split)
+    return split
+
+
+def _config_dict(
+    config: TrainingConfig,
+    split: TimeSplit,
+    device: torch.device,
+    training: _Partition,
+    validation: _Partition,
+    calibration: _Partition,
+    test: _Partition,
+) -> dict[str, object]:
+    return {
         "batch_size": config.batch_size,
         "d_model": config.d_model,
         "deadband_mw": config.deadband_mw,
+        "deterministic": config.deterministic,
+        "device": str(device),
         "early_stopping_patience": config.early_stopping_patience,
         "epochs": config.epochs,
         "gradient_clip_norm": config.gradient_clip_norm,
         "learning_rate": config.learning_rate,
         "mixture_components": config.mixture_components,
+        "mixed_precision": config.mixed_precision,
+        "partitions": {
+            "calibration": _partition_metadata(calibration),
+            "test": _partition_metadata(test),
+            "train": _partition_metadata(training),
+            "validation": _partition_metadata(validation),
+        },
         "seeds": list(config.seeds),
+        "split": {
+            name: {"start": section.start, "stop": section.stop}
+            for name, section in (
+                ("train", split.train),
+                ("validation", split.validation),
+                ("calibration", split.calibration),
+                ("test", split.test),
+            )
+        },
         "tcn_blocks": config.tcn_blocks,
         "transformer_heads": config.transformer_heads,
         "transformer_layers": config.transformer_layers,
         "warmup_epochs": config.warmup_epochs,
         "weight_decay": config.weight_decay,
     }
-    if config.split is not None:
-        value["split"] = {
-            name: {"start": section.start, "stop": section.stop}
-            for name, section in (
-                ("train", config.split.train),
-                ("validation", config.split.validation),
-                ("calibration", config.split.calibration),
-                ("test", config.split.test),
-            )
-        }
-    return value
+
+
+def _partition_metadata(partition: _Partition) -> dict[str, object]:
+    return {
+        "count": partition.count,
+        "end": partition.dataset.example_at(partition.section.stop - 1).cutoff.isoformat(),
+        "start": partition.sample().cutoff.isoformat(),
+    }
 
 
 def _write_json(path: Path, value: object) -> None:

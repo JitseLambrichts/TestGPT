@@ -2,8 +2,10 @@ import hashlib
 import json
 import os
 import shutil
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain, islice
 from pathlib import Path
 
 import numpy as np
@@ -11,20 +13,121 @@ from numpy.typing import NDArray
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.training.data import TrainingExample
+from imbalance_pipeline.training.splits import IndexRange
 
-_SHARD_NAME = "shard-00000.npz"
+_DEFAULT_SHARD_SIZE = 4_096
 _FORMAT_VERSION = 1
 
 
+@dataclass(frozen=True, slots=True)
+class TrainingShard:
+    name: str
+    count: int
+    checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingDataset:
+    root: Path
+    feature_schema_hash: str
+    shards: tuple[TrainingShard, ...]
+
+    @property
+    def count(self) -> int:
+        return sum(shard.count for shard in self.shards)
+
+    def cutoffs(self) -> list[datetime]:
+        values: list[datetime] = []
+        for shard in self.shards:
+            values.extend(
+                _load_shard_cutoffs(
+                    self.root / shard.name,
+                    expected_checksum=shard.checksum,
+                    expected_count=shard.count,
+                )
+            )
+        return values
+
+    def example_at(self, index: int) -> TrainingExample:
+        if index < 0 or index >= self.count:
+            raise IndexError("training dataset example index is outside the dataset")
+        return next(self.iter_range(IndexRange(index, index + 1)))
+
+    def iter_range(self, section: IndexRange) -> Iterator[TrainingExample]:
+        if section.stop > self.count:
+            raise ValueError("training dataset range is outside the dataset")
+        offset = 0
+        for shard in self.shards:
+            shard_start = offset
+            shard_stop = offset + shard.count
+            offset = shard_stop
+            start = max(section.start, shard_start)
+            stop = min(section.stop, shard_stop)
+            if start >= stop:
+                continue
+            yield from _load_shard_indices(
+                self.root / shard.name,
+                self.feature_schema_hash,
+                range(start - shard_start, stop - shard_start),
+                expected_checksum=shard.checksum,
+            )
+
+    def iter_batches(
+        self,
+        section: IndexRange,
+        *,
+        batch_size: int,
+        seed: int | None = None,
+    ) -> Iterator[list[TrainingExample]]:
+        if batch_size <= 0:
+            raise ValueError("training dataset batch_size must be positive")
+        if section.stop > self.count:
+            raise ValueError("training dataset range is outside the dataset")
+        chunks: list[tuple[TrainingShard, int, int]] = []
+        offset = 0
+        for shard in self.shards:
+            start = max(section.start, offset)
+            stop = min(section.stop, offset + shard.count)
+            if start < stop:
+                chunks.append((shard, start - offset, stop - offset))
+            offset += shard.count
+        generator = np.random.default_rng(seed)
+        order = generator.permutation(len(chunks)) if seed is not None else np.arange(len(chunks))
+        batch: list[TrainingExample] = []
+        for chunk_index in order:
+            shard, start, stop = chunks[int(chunk_index)]
+            indices = np.arange(start, stop)
+            if seed is not None:
+                generator.shuffle(indices)
+            for example in _load_shard_indices(
+                self.root / shard.name,
+                self.feature_schema_hash,
+                indices.tolist(),
+                expected_checksum=shard.checksum,
+            ):
+                batch.append(example)
+                if len(batch) == batch_size:
+                    yield batch
+                    batch = []
+        if batch:
+            yield batch
+
+
 def write_training_dataset(
-    examples: Sequence[TrainingExample],
+    examples: Iterable[TrainingExample],
     output: Path,
     *,
     force: bool = False,
+    shard_size: int = _DEFAULT_SHARD_SIZE,
 ) -> Path:
-    if not examples:
-        raise ValueError("cannot export an empty training dataset")
-    schema_hash = _shared_schema(examples)
+    if shard_size <= 0:
+        raise ValueError("training dataset shard_size must be positive")
+    iterator = iter(examples)
+    try:
+        first = next(iterator)
+    except StopIteration as exc:
+        raise ValueError("cannot export an empty training dataset") from exc
+    schema_hash = first.feature_schema_hash
     output = Path(output)
     if output.exists():
         if not force:
@@ -41,16 +144,32 @@ def write_training_dataset(
             temporary.unlink()
     temporary.mkdir(parents=True)
     try:
-        shard = temporary / _SHARD_NAME
-        np.savez_compressed(shard, **_arrays(examples))  # type: ignore[arg-type]
-        checksum = _sha256(shard)
+        count = 0
+        minimum = first.cutoff
+        maximum = first.cutoff
+        shards: list[dict[str, object]] = []
+        for index, chunk in enumerate(_chunks(chain((first,), iterator), shard_size)):
+            if any(example.feature_schema_hash != schema_hash for example in chunk):
+                raise ValueError("training dataset must use one feature schema hash")
+            shard = temporary / f"shard-{index:05d}.npz"
+            np.savez_compressed(shard, **_arrays(chunk))  # type: ignore[arg-type]
+            shards.append(
+                {
+                    "checksum": _sha256(shard),
+                    "count": len(chunk),
+                    "name": shard.name,
+                }
+            )
+            count += len(chunk)
+            minimum = min(minimum, *(example.cutoff for example in chunk))
+            maximum = max(maximum, *(example.cutoff for example in chunk))
         metadata = {
-            "count": len(examples),
+            "count": count,
             "feature_schema_hash": schema_hash,
             "format_version": _FORMAT_VERSION,
-            "max_cutoff": max(example.cutoff for example in examples).isoformat(),
-            "min_cutoff": min(example.cutoff for example in examples).isoformat(),
-            "shards": [{"checksum": checksum, "count": len(examples), "name": _SHARD_NAME}],
+            "max_cutoff": maximum.isoformat(),
+            "min_cutoff": minimum.isoformat(),
+            "shards": shards,
         }
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
@@ -65,28 +184,39 @@ def write_training_dataset(
 
 
 def load_training_dataset(dataset: Path) -> list[TrainingExample]:
+    opened = open_training_dataset(dataset)
+    return list(opened.iter_range(IndexRange(0, opened.count)))
+
+
+def open_training_dataset(dataset: Path) -> TrainingDataset:
     root = Path(dataset)
     metadata = _metadata(root)
     schema_hash = _required_string(metadata, "feature_schema_hash")
-    shards = metadata.get("shards")
-    if not isinstance(shards, list) or not shards:
+    raw_shards = metadata.get("shards")
+    if not isinstance(raw_shards, list) or not raw_shards:
         raise ValueError("training dataset metadata requires non-empty shards")
-    loaded: list[TrainingExample] = []
-    for shard in shards:
+    shards: list[TrainingShard] = []
+    for shard in raw_shards:
         if not isinstance(shard, dict):
             raise ValueError("training dataset shard metadata is invalid")
         name = _required_string(shard, "name")
         expected_checksum = _required_string(shard, "checksum")
+        count = shard.get("count")
+        if not isinstance(count, int) or count <= 0:
+            raise ValueError("training dataset shard count is invalid")
         path = root / name
         if not path.is_file():
             raise ValueError(f"missing training dataset shard {name}")
-        if _sha256(path) != expected_checksum:
-            raise ValueError(f"checksum mismatch for training dataset shard {name}")
-        loaded.extend(_load_shard(path, schema_hash))
+        shards.append(TrainingShard(name=name, count=count, checksum=expected_checksum))
     expected_count = metadata.get("count")
-    if not isinstance(expected_count, int) or expected_count != len(loaded):
+    shard_count = sum(shard.count for shard in shards)
+    if not isinstance(expected_count, int) or expected_count != shard_count:
         raise ValueError("training dataset count does not match metadata")
-    return loaded
+    return TrainingDataset(
+        root=root,
+        feature_schema_hash=schema_hash,
+        shards=tuple(shards),
+    )
 
 
 def _arrays(examples: Sequence[TrainingExample]) -> dict[str, NDArray[np.generic]]:
@@ -112,7 +242,46 @@ def _arrays(examples: Sequence[TrainingExample]) -> dict[str, NDArray[np.generic
     }
 
 
+def _chunks(
+    examples: Iterable[TrainingExample],
+    size: int,
+) -> Iterator[list[TrainingExample]]:
+    iterator = iter(examples)
+    while chunk := list(islice(iterator, size)):
+        yield chunk
+
+
 def _load_shard(path: Path, schema_hash: str) -> list[TrainingExample]:
+    return list(_load_shard_indices(path, schema_hash, None))
+
+
+def _load_shard_cutoffs(
+    path: Path,
+    *,
+    expected_checksum: str,
+    expected_count: int,
+) -> list[datetime]:
+    if _sha256(path) != expected_checksum:
+        raise ValueError(f"checksum mismatch for training dataset shard {path.name}")
+    try:
+        with np.load(path, allow_pickle=False) as values:
+            cutoffs = np.asarray(values["cutoff"])
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError(f"cannot read training dataset shard {path.name}") from exc
+    if len(cutoffs) != expected_count:
+        raise ValueError(f"training dataset shard {path.name} has inconsistent row counts")
+    return [_utc_datetime(str(value)) for value in cutoffs]
+
+
+def _load_shard_indices(
+    path: Path,
+    schema_hash: str,
+    indices: Sequence[int] | None,
+    *,
+    expected_checksum: str | None = None,
+) -> Iterator[TrainingExample]:
+    if expected_checksum is not None and _sha256(path) != expected_checksum:
+        raise ValueError(f"checksum mismatch for training dataset shard {path.name}")
     try:
         with np.load(path, allow_pickle=False) as values:
             arrays = {name: np.asarray(values[name]) for name in values.files}
@@ -142,28 +311,37 @@ def _load_shard(path: Path, schema_hash: str) -> list[TrainingExample]:
     if count == 0 or any(array.shape[0] != count for array in arrays.values()):
         raise ValueError(f"training dataset shard {path.name} has inconsistent row counts")
     _binary_masks(arrays, path.name)
-    return [
-        TrainingExample(
-            event_id=str(arrays["event_id"][index]),
-            cutoff=_utc_datetime(str(arrays["cutoff"][index])),
-            feature_schema_hash=schema_hash,
-            local_values=np.asarray(arrays["local_values"][index], dtype=np.float32),
-            local_masks=np.asarray(arrays["local_masks"][index], dtype=np.uint8),
-            context_values=np.asarray(arrays["context_values"][index], dtype=np.float32),
-            context_masks=np.asarray(arrays["context_masks"][index], dtype=np.uint8),
-            static_values=np.asarray(arrays["static_values"][index], dtype=np.float32),
-            static_masks=np.asarray(arrays["static_masks"][index], dtype=np.uint8),
-            target_next=float(arrays["target_next"][index]),
-            target_delta=float(arrays["target_delta"][index]),
-            delta_mask=float(arrays["delta_mask"][index]),
-            auxiliary_target=np.asarray(arrays["auxiliary_target"][index], dtype=np.float32),
-            auxiliary_mask=np.asarray(arrays["auxiliary_mask"][index], dtype=np.float32),
-            current_state=_state_from_value(arrays["current_state"][index]),
-            flip_target=float(arrays["flip_target"][index]),
-            flip_mask=float(arrays["flip_mask"][index]),
-        )
-        for index in range(count)
-    ]
+    selected: Sequence[int] = range(count) if indices is None else indices
+    if any(index < 0 or index >= count for index in selected):
+        raise ValueError(f"training dataset shard {path.name} range is outside the shard")
+    for index in selected:
+        yield _example_from_arrays(arrays, index, schema_hash)
+
+
+def _example_from_arrays(
+    arrays: dict[str, NDArray[np.generic]],
+    index: int,
+    schema_hash: str,
+) -> TrainingExample:
+    return TrainingExample(
+        event_id=str(arrays["event_id"][index]),
+        cutoff=_utc_datetime(str(arrays["cutoff"][index])),
+        feature_schema_hash=schema_hash,
+        local_values=np.array(arrays["local_values"][index], dtype=np.float32, copy=True),
+        local_masks=np.array(arrays["local_masks"][index], dtype=np.uint8, copy=True),
+        context_values=np.array(arrays["context_values"][index], dtype=np.float32, copy=True),
+        context_masks=np.array(arrays["context_masks"][index], dtype=np.uint8, copy=True),
+        static_values=np.array(arrays["static_values"][index], dtype=np.float32, copy=True),
+        static_masks=np.array(arrays["static_masks"][index], dtype=np.uint8, copy=True),
+        target_next=float(arrays["target_next"][index]),
+        target_delta=float(arrays["target_delta"][index]),
+        delta_mask=float(arrays["delta_mask"][index]),
+        auxiliary_target=np.array(arrays["auxiliary_target"][index], dtype=np.float32, copy=True),
+        auxiliary_mask=np.array(arrays["auxiliary_mask"][index], dtype=np.float32, copy=True),
+        current_state=_state_from_value(arrays["current_state"][index]),
+        flip_target=float(arrays["flip_target"][index]),
+        flip_mask=float(arrays["flip_mask"][index]),
+    )
 
 
 def _metadata(root: Path) -> dict[str, object]:

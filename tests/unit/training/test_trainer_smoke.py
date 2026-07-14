@@ -3,13 +3,19 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.model.bundle import validate_bundle
 from imbalance_pipeline.training.data import TrainingExample
 from imbalance_pipeline.training.export_data import write_training_dataset
 from imbalance_pipeline.training.splits import IndexRange, TimeSplit
-from imbalance_pipeline.training.train import TrainingConfig, train_ensemble
+from imbalance_pipeline.training.train import (
+    TrainingConfig,
+    _resolve_split,
+    _validation_objective,
+    train_ensemble,
+)
 
 
 def test_train_ensemble_writes_three_seeded_onnx_members_and_evaluation(tmp_path: Path) -> None:
@@ -32,6 +38,8 @@ def test_train_ensemble_writes_three_seeded_onnx_members_and_evaluation(tmp_path
 
     candidate = train_ensemble(dataset, tmp_path / "candidate", config)
     evaluation = json.loads((candidate / "evaluation.json").read_text())
+    baselines = json.loads((candidate / "baseline_evaluation.json").read_text())
+    run_config = json.loads((candidate / "run_config.json").read_text())
     validation = validate_bundle(candidate, expected_schema_hash="synthetic-schema")
 
     assert candidate == tmp_path / "candidate"
@@ -39,6 +47,40 @@ def test_train_ensemble_writes_three_seeded_onnx_members_and_evaluation(tmp_path
     assert [member["seed"] for member in evaluation["members"]] == [17, 29, 43]
     assert all(np.isfinite(member["best_validation_loss"]) for member in evaluation["members"])
     assert all((candidate / f"member-{index}.pt").is_file() for index in range(3))
+    assert {"persistence", "clipped_linear_drift", "rolling_median", "classical"} == set(
+        baselines
+    )
+    assert "current_positive" in evaluation["candidate"]["cohort_mae"]
+    assert run_config["device"] == "cpu"
+    assert run_config["split"]["test"] == {"start": 26, "stop": 32}
+
+
+def test_trainer_resolves_default_at_the_latest_dataset_period_and_rejects_leakage() -> None:
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    timestamps = [start + timedelta(minutes=index) for index in range(365 * 24 * 60)]
+    invalid = TimeSplit(
+        train=IndexRange(0, 20),
+        validation=IndexRange(10, 24),
+        calibration=IndexRange(25, 30),
+        test=IndexRange(31, 36),
+    )
+
+    resolved = _resolve_split(timestamps, TrainingConfig())
+
+    assert resolved.test.stop == len(timestamps)
+    with pytest.raises(ValueError, match="strictly chronological and disjoint"):
+        _resolve_split(timestamps, TrainingConfig(split=invalid))
+
+
+def test_validation_objective_weights_examples_and_known_flip_labels_not_batches() -> None:
+    value = _validation_objective(
+        nll_sum=10.0 * 100 + 1_000.0,
+        nll_count=101,
+        brier_sum=0.5,
+        brier_count=1,
+    )
+
+    assert value == pytest.approx((2_000.0 / 101) + 0.125)
 
 
 def _examples() -> list[TrainingExample]:

@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,26 +19,33 @@ class BaselineValues:
     flip_probability: NDArray[np.float64]
 
 
-def persistence_baseline(examples: Sequence[TrainingExample]) -> NDArray[np.float64]:
+def persistence_baseline(examples: Iterable[TrainingExample]) -> NDArray[np.float64]:
     return np.asarray([_latest_observed(example) for example in examples], dtype=np.float64)
 
 
-def clipped_linear_drift_baseline(examples: Sequence[TrainingExample]) -> NDArray[np.float64]:
+def clipped_linear_drift_baseline(examples: Iterable[TrainingExample]) -> NDArray[np.float64]:
     return np.asarray([_linear_drift(example) for example in examples], dtype=np.float64)
 
 
-def rolling_median_baseline(examples: Sequence[TrainingExample]) -> NDArray[np.float64]:
+def rolling_median_baseline(examples: Iterable[TrainingExample]) -> NDArray[np.float64]:
     return np.asarray([_rolling_median(example) for example in examples], dtype=np.float64)
 
 
 def classical_baseline(
-    training: Sequence[TrainingExample],
-    evaluation: Sequence[TrainingExample],
+    training: Iterable[TrainingExample],
+    evaluation: Iterable[TrainingExample],
+    *,
+    max_training_examples: int = 100_000,
 ) -> BaselineValues:
-    if not training or not evaluation:
+    if max_training_examples <= 0:
+        raise ValueError("classical baseline max_training_examples must be positive")
+    train_features, train_target, train_flip_target, train_flip_mask = _training_reservoir(
+        training,
+        max_examples=max_training_examples,
+    )
+    evaluation_features = _compact_features(evaluation)
+    if len(train_features) == 0 or len(evaluation_features) == 0:
         raise ValueError("classical baseline requires non-empty training and evaluation examples")
-    train_features = _flatten_features(training)
-    evaluation_features = _flatten_features(evaluation)
     regressor = HistGradientBoostingRegressor(
         learning_rate=0.05,
         l2_regularization=1.0,
@@ -47,20 +54,26 @@ def classical_baseline(
         random_state=17,
     ).fit(
         train_features,
-        np.asarray([example.target_next for example in training], dtype=np.float64),
+        train_target,
     )
     point_prediction = np.asarray(regressor.predict(evaluation_features), dtype=np.float64)
-    flip_probability = _classical_flip_probability(train_features, evaluation_features, training)
+    flip_probability = _classical_flip_probability(
+        train_features,
+        evaluation_features,
+        train_flip_target,
+        train_flip_mask,
+    )
     return BaselineValues(predicted_mw=point_prediction, flip_probability=flip_probability)
 
 
 def _classical_flip_probability(
     train_features: NDArray[np.float64],
     evaluation_features: NDArray[np.float64],
-    training: Sequence[TrainingExample],
+    flip_target: NDArray[np.int64],
+    flip_mask: NDArray[np.bool_],
 ) -> NDArray[np.float64]:
-    eligible = np.asarray([example.flip_mask > 0.5 for example in training])
-    target = np.asarray([example.flip_target for example in training], dtype=np.int64)[eligible]
+    eligible = flip_mask
+    target = flip_target[eligible]
     if len(target) == 0:
         return np.zeros(len(evaluation_features), dtype=np.float64)
     base_rate = float(np.mean(target))
@@ -76,23 +89,84 @@ def _classical_flip_probability(
     return np.asarray(classifier.predict_proba(evaluation_features)[:, 1], dtype=np.float64)
 
 
-def _flatten_features(examples: Sequence[TrainingExample]) -> NDArray[np.float64]:
-    matrix = np.asarray([_flatten_example(example) for example in examples], dtype=np.float64)
+def _training_reservoir(
+    examples: Iterable[TrainingExample],
+    *,
+    max_examples: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64], NDArray[np.bool_]]:
+    generator = np.random.default_rng(17)
+    features: list[NDArray[np.float64]] = []
+    target: list[float] = []
+    flip_target: list[int] = []
+    flip_mask: list[bool] = []
+    for count, example in enumerate(examples):
+        candidate = _compact_example(example)
+        if len(features) < max_examples:
+            index = len(features)
+            features.append(candidate)
+            target.append(example.target_next)
+            flip_target.append(int(example.flip_target > 0.5))
+            flip_mask.append(example.flip_mask > 0.5)
+        else:
+            index = int(generator.integers(0, count + 1))
+            if index >= max_examples:
+                continue
+            features[index] = candidate
+            target[index] = example.target_next
+            flip_target[index] = int(example.flip_target > 0.5)
+            flip_mask[index] = example.flip_mask > 0.5
+    matrix = _feature_matrix(features)
+    return (
+        matrix,
+        np.asarray(target, dtype=np.float64),
+        np.asarray(flip_target, dtype=np.int64),
+        np.asarray(flip_mask, dtype=bool),
+    )
+
+
+def _compact_features(examples: Iterable[TrainingExample]) -> NDArray[np.float64]:
+    return _feature_matrix([_compact_example(example) for example in examples])
+
+
+def _feature_matrix(features: Sequence[NDArray[np.float64]]) -> NDArray[np.float64]:
+    matrix = np.asarray(features, dtype=np.float64)
     if matrix.ndim != 2 or not np.isfinite(matrix).all():
         raise ValueError("baseline features must be finite and have matching shapes")
     return matrix
 
 
-def _flatten_example(example: TrainingExample) -> NDArray[np.float64]:
-    arrays = (
-        example.local_values,
-        example.local_masks,
-        example.context_values,
-        example.context_masks,
-        example.static_values,
-        example.static_masks,
+def _compact_example(example: TrainingExample) -> NDArray[np.float64]:
+    summaries = (
+        _summary(example.local_values, example.local_masks),
+        _summary(example.context_values, example.context_masks),
+        _summary(example.static_values, example.static_masks),
     )
-    return np.concatenate([np.asarray(values, dtype=np.float64).reshape(-1) for values in arrays])
+    return np.concatenate(summaries)
+
+
+def _summary(
+    values: NDArray[np.float32],
+    masks: NDArray[np.uint8],
+) -> NDArray[np.float64]:
+    if values.shape != masks.shape:
+        raise ValueError("baseline feature values and masks must have matching shapes")
+    observed = np.asarray(values[masks == 1], dtype=np.float64)
+    if not len(observed):
+        return np.zeros(7, dtype=np.float64)
+    if not np.isfinite(observed).all():
+        raise ValueError("observed baseline features must be finite")
+    return np.asarray(
+        (
+            observed[-1],
+            np.mean(observed),
+            np.std(observed),
+            np.min(observed),
+            np.max(observed),
+            np.median(observed),
+            observed[-1] - observed[0],
+        ),
+        dtype=np.float64,
+    )
 
 
 def _observed_history(example: TrainingExample) -> NDArray[np.float64]:

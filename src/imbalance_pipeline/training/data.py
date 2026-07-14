@@ -1,5 +1,5 @@
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
@@ -165,6 +165,32 @@ class RobustPreprocessor:
             static_scale=static_scale,
         )
 
+    @classmethod
+    def fit_stream(
+        cls,
+        examples: Iterable[TrainingExample],
+        *,
+        max_examples: int = 512,
+        seed: int = 17,
+    ) -> "RobustPreprocessor":
+        """Fit robust statistics from a deterministic bounded reservoir of examples."""
+        if max_examples <= 0:
+            raise ValueError("preprocessing max_examples must be positive")
+        generator = np.random.default_rng(seed)
+        reservoir: list[TrainingExample] = []
+        count = 0
+        for example in examples:
+            if len(reservoir) < max_examples:
+                reservoir.append(example)
+            else:
+                replacement = int(generator.integers(0, count + 1))
+                if replacement < max_examples:
+                    reservoir[replacement] = example
+            count += 1
+        if not reservoir:
+            raise ValueError("cannot fit preprocessing without training examples")
+        return cls.fit(reservoir)
+
     def transform(self, snapshot: FeatureSnapshot) -> PreparedFeatures:
         if snapshot.feature_schema_hash != self.feature_schema_hash:
             raise ValueError("feature schema hash does not match fitted preprocessing")
@@ -190,6 +216,60 @@ class RobustPreprocessor:
                 self.static_scale,
             ),
             static_masks=_binary_masks(snapshot.static_masks),
+        )
+
+    def transform_batch(self, batch: TrainingBatch) -> TrainingBatch:
+        """Apply fitted feature scaling to one CPU batch without touching targets or masks."""
+        if any(
+            tensor.device.type != "cpu"
+            for tensor in (
+                batch.local,
+                batch.local_mask,
+                batch.context,
+                batch.context_mask,
+                batch.static,
+                batch.static_mask,
+            )
+        ):
+            raise ValueError("preprocessing batches must be transformed before device transfer")
+        _require_feature_width(batch.local, self.local_location, "local")
+        _require_feature_width(batch.context, self.context_location, "context")
+        _require_feature_width(batch.static, self.static_location, "static")
+        return replace(
+            batch,
+            local=torch.from_numpy(
+                _transform(
+                    batch.local.numpy(),
+                    batch.local_mask.numpy(),
+                    self.local_location,
+                    self.local_scale,
+                )
+            ),
+            local_mask=torch.from_numpy(_binary_masks(batch.local_mask.numpy())).to(
+                dtype=batch.local_mask.dtype
+            ),
+            context=torch.from_numpy(
+                _transform(
+                    batch.context.numpy(),
+                    batch.context_mask.numpy(),
+                    self.context_location,
+                    self.context_scale,
+                )
+            ),
+            context_mask=torch.from_numpy(_binary_masks(batch.context_mask.numpy())).to(
+                dtype=batch.context_mask.dtype
+            ),
+            static=torch.from_numpy(
+                _transform(
+                    batch.static.numpy(),
+                    batch.static_mask.numpy(),
+                    self.static_location,
+                    self.static_scale,
+                )
+            ),
+            static_mask=torch.from_numpy(_binary_masks(batch.static_mask.numpy())).to(
+                dtype=batch.static_mask.dtype
+            ),
         )
 
     def to_json(self) -> str:
@@ -364,6 +444,15 @@ def _robust_statistics(
             lower, upper = np.quantile(observed, (0.25, 0.75))
             scales[index] = np.float32(max(float(upper - lower), _EPSILON))
     return locations, scales
+
+
+def _require_feature_width(
+    values: Tensor,
+    location: NDArray[np.float32],
+    name: str,
+) -> None:
+    if values.ndim < 2 or values.shape[-1] != len(location):
+        raise ValueError(f"{name} batch width does not match fitted preprocessing")
 
 
 def _transform(

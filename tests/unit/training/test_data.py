@@ -1,11 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
+import torch
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.features.engine import FeatureSnapshot
 from imbalance_pipeline.training.data import (
     RobustPreprocessor,
+    TrainingBatch,
     build_training_examples,
     preprocess_training_examples,
 )
@@ -127,3 +129,39 @@ def test_preprocess_training_examples_uses_fitted_statistics_without_changing_la
     assert transformed.target_next == held_out_example.target_next
     assert transformed.flip_target == held_out_example.flip_target
     assert transformed.local_values[-1, 0] == 12.0
+
+
+def test_streaming_preprocessor_matches_full_fit_when_its_reservoir_covers_input() -> None:
+    examples = [
+        build_training_examples(
+            [
+                snapshot(
+                    cutoff=NOW + timedelta(minutes=index),
+                    current_state=ConfirmedState.POSITIVE,
+                )
+            ],
+            {NOW + timedelta(minutes=index + 1): float(index)},
+        )[0]
+        for index in range(3)
+    ]
+
+    full = RobustPreprocessor.fit(examples)
+    streamed = RobustPreprocessor.fit_stream(iter(examples), max_examples=3, seed=17)
+
+    np.testing.assert_allclose(streamed.local_location, full.local_location)
+    np.testing.assert_allclose(streamed.context_scale, full.context_scale)
+
+
+def test_batch_preprocessing_transforms_only_features_and_keeps_labels_on_cpu() -> None:
+    example = build_training_examples(
+        [snapshot(current_state=ConfirmedState.POSITIVE)],
+        targets(12.0),
+    )[0]
+    batch = TrainingBatch.from_examples([example], batch_id="streaming")
+
+    transformed = RobustPreprocessor.fit([example]).transform_batch(batch)
+
+    assert transformed.local.shape == batch.local.shape
+    assert transformed.target_next.item() == batch.target_next.item()
+    assert transformed.local.device.type == "cpu"
+    assert torch.equal(transformed.flip_mask, batch.flip_mask)

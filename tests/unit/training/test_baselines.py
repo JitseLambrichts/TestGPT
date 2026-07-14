@@ -52,6 +52,28 @@ def test_classical_baseline_returns_finite_point_and_flip_probability() -> None:
     assert np.all((0.0 <= result.flip_probability) & (result.flip_probability <= 1.0))
 
 
+def test_classical_baseline_accepts_streams_and_bounds_its_training_reservoir() -> None:
+    training = (
+        _example(
+            history=[float(index), float(index + 1), float(index + 2)],
+            target=float(index + 3),
+        )
+        for index in range(12)
+    )
+    evaluation = (
+        _example(
+            history=[float(index), float(index + 1), float(index + 2)],
+            target=float(index + 3),
+        )
+        for index in range(12, 16)
+    )
+
+    result = classical_baseline(training, evaluation, max_training_examples=3)
+
+    assert result.predicted_mw.shape == (4,)
+    assert result.flip_probability.shape == (4,)
+
+
 def _example(*, history: list[float], target: float) -> TrainingExample:
     cutoff = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
     values = np.asarray([[value, value * 2] for value in history], dtype=np.float32)

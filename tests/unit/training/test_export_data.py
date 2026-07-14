@@ -6,7 +6,12 @@ import pytest
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.training.data import TrainingExample
-from imbalance_pipeline.training.export_data import load_training_dataset, write_training_dataset
+from imbalance_pipeline.training.export_data import (
+    load_training_dataset,
+    open_training_dataset,
+    write_training_dataset,
+)
+from imbalance_pipeline.training.splits import IndexRange
 
 
 def test_training_dataset_round_trips_checksums_schema_and_binary_masks(tmp_path: Path) -> None:
@@ -34,6 +39,35 @@ def test_training_dataset_rejects_a_tampered_shard_and_overwrite_without_force(
         load_training_dataset(output)
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         write_training_dataset([_example("two", 2.0)], output)
+
+
+def test_training_dataset_opens_shards_lazily_and_iterates_only_requested_rows(
+    tmp_path: Path,
+) -> None:
+    output = write_training_dataset(
+        [_example("zero", 0.0), _example("one", 1.0), _example("two", 2.0)],
+        tmp_path / "dataset",
+        shard_size=2,
+    )
+
+    dataset = open_training_dataset(output)
+
+    assert dataset.count == 3
+    assert len(dataset.shards) == 2
+    assert [item.event_id for item in dataset.iter_range(IndexRange(1, 3))] == ["one", "two"]
+    assert dataset.example_at(0).event_id == "zero"
+    assert dataset.cutoffs() == [
+        datetime(2026, 7, 13, 10, 0, tzinfo=UTC),
+        datetime(2026, 7, 13, 10, 0, tzinfo=UTC),
+        datetime(2026, 7, 13, 10, 0, tzinfo=UTC),
+    ]
+    batches = list(dataset.iter_batches(IndexRange(0, 3), batch_size=2, seed=17))
+    assert sorted(example.event_id for batch in batches for example in batch) == [
+        "one",
+        "two",
+        "zero",
+    ]
+    assert [len(batch) for batch in batches] == [2, 1]
 
 
 def _example(event_id: str, value: float) -> TrainingExample:

@@ -6,7 +6,7 @@ from imbalance_pipeline.training.calibration import IsotonicCalibrator, select_f
 
 def test_isotonic_calibration_is_bounded_round_trips_and_does_not_worsen_fit_brier() -> None:
     probability = np.asarray([0.9, 0.8, 0.7, 0.2, 0.1, 0.05])
-    target = np.asarray([1, 0, 0, 1, 0, 1])
+    target = np.asarray([1, 0, 0, 1, 0, 1], dtype=np.int64)
     calibrator = IsotonicCalibrator.fit(probability, target)
 
     calibrated = calibrator.predict(probability)
@@ -22,7 +22,7 @@ def test_isotonic_calibration_is_bounded_round_trips_and_does_not_worsen_fit_bri
 def test_threshold_selection_uses_the_lower_threshold_for_an_f1_tie() -> None:
     threshold = select_f1_threshold(
         np.asarray([0.8, 0.6, 0.5, 0.4]),
-        np.asarray([1, 0, 0, 1]),
+        np.asarray([1, 0, 0, 1], dtype=np.int64),
     )
 
     assert threshold == 0.4

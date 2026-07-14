@@ -49,6 +49,7 @@ def evaluate_predictions(
     flip_target: NDArray[np.int64],
     flip_probability: NDArray[np.float64],
     threshold: float,
+    flip_mask: NDArray[np.bool_] | None = None,
     cohorts: Mapping[str, NDArray[np.bool_]] | None = None,
 ) -> EvaluationReport:
     arrays = (actual_mw, predicted_mw, p10_mw, p90_mw, flip_target, flip_probability)
@@ -61,28 +62,34 @@ def evaluate_predictions(
         raise ValueError("evaluation arrays must be finite")
     if np.any(p10_mw > p90_mw) or np.any((flip_target != 0) & (flip_target != 1)):
         raise ValueError("prediction intervals and flip labels are invalid")
+    mask = np.ones(count, dtype=bool) if flip_mask is None else np.asarray(flip_mask, dtype=bool)
+    if len(mask) != count or not np.any(mask):
+        raise ValueError("evaluation requires at least one known flip label")
     error = predicted_mw - actual_mw
-    predicted_flip = flip_probability >= threshold
-    truth = flip_target.astype(bool)
+    predicted_flip = flip_probability[mask] >= threshold
+    truth = flip_target[mask].astype(bool)
     true_positive = int(np.count_nonzero(predicted_flip & truth))
     false_positive = int(np.count_nonzero(predicted_flip & ~truth))
     false_negative = int(np.count_nonzero(~predicted_flip & truth))
     precision = _ratio(true_positive, true_positive + false_positive)
     recall = _ratio(true_positive, true_positive + false_negative)
     f1 = _ratio(2 * true_positive, 2 * true_positive + false_positive + false_negative)
-    probability = np.clip(flip_probability, 1e-6, 1.0 - 1e-6)
+    probability = np.clip(flip_probability[mask], 1e-6, 1.0 - 1e-6)
+    known_target = flip_target[mask]
     cohort_mae = _cohort_mae(np.abs(error), cohorts)
     return EvaluationReport(
         mae=float(np.mean(np.abs(error))),
         rmse=math.sqrt(float(np.mean(error**2))),
-        brier=float(np.mean((flip_probability - flip_target) ** 2)),
+        brier=float(np.mean((flip_probability[mask] - known_target) ** 2)),
         log_loss=float(
-            -np.mean(flip_target * np.log(probability) + (1 - flip_target) * np.log1p(-probability))
+            -np.mean(
+                known_target * np.log(probability) + (1 - known_target) * np.log1p(-probability)
+            )
         ),
         precision=precision,
         recall=recall,
         f1=f1,
-        pr_auc=_average_precision(flip_target, flip_probability),
+        pr_auc=_average_precision(known_target, flip_probability[mask]),
         interval_coverage=float(np.mean((actual_mw >= p10_mw) & (actual_mw <= p90_mw))),
         cohort_mae=cohort_mae,
     )

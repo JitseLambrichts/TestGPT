@@ -2,6 +2,7 @@ import math
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from imbalance_pipeline.training.metrics import (
     EvaluationReport,
@@ -16,7 +17,7 @@ def test_metrics_match_known_regression_probability_and_interval_values() -> Non
         predicted_mw=np.asarray([0.0, 4.0, 2.0, 6.0]),
         p10_mw=np.asarray([-1.0, 3.0, 3.0, 7.0]),
         p90_mw=np.asarray([1.0, 4.0, 5.0, 8.0]),
-        flip_target=np.asarray([0, 1, 1, 0]),
+        flip_target=np.asarray([0, 1, 1, 0], dtype=np.int64),
         flip_probability=np.asarray([0.1, 0.8, 0.6, 0.2]),
         threshold=0.5,
     )
@@ -80,3 +81,21 @@ def test_promotion_requires_every_safety_and_quality_gate() -> None:
     assert accepted.reasons == ()
     assert rejected.promote is False
     assert "interval coverage must be between 75% and 85%" in rejected.reasons
+
+
+def test_regression_metrics_keep_unknown_state_rows_while_flip_metrics_mask_them() -> None:
+    report = evaluate_predictions(
+        actual_mw=np.asarray([0.0, 1_000.0]),
+        predicted_mw=np.asarray([0.0, 0.0]),
+        p10_mw=np.asarray([0.0, 0.0]),
+        p90_mw=np.asarray([0.0, 0.0]),
+        flip_target=np.asarray([0, 1], dtype=np.int64),
+        flip_probability=np.asarray([0.1, 0.9]),
+        flip_mask=np.asarray([True, False], dtype=bool),
+        threshold=0.5,
+    )
+
+    assert report.mae == 500.0
+    assert report.rmse == math.sqrt(500_000.0)
+    assert report.brier == pytest.approx(0.01)
+    assert report.precision == 0.0

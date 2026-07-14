@@ -2,7 +2,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from imbalance_pipeline.training.splits import walk_forward_splits
+from imbalance_pipeline.training.splits import (
+    IndexRange,
+    TimeSplit,
+    latest_purged_split,
+    validate_time_split,
+    walk_forward_splits,
+)
 
 
 def minute_timestamps(days: int) -> list[datetime]:
@@ -50,3 +56,35 @@ def test_walk_forward_splits_reject_insufficient_or_non_chronological_data() -> 
         walk_forward_splits([timestamp, timestamp], folds=1, gap_minutes=1)
     with pytest.raises(ValueError, match="cannot form"):
         walk_forward_splits([timestamp + timedelta(minutes=index) for index in range(10)], folds=1)
+
+
+def test_latest_purged_split_anchors_the_untouched_test_at_dataset_end() -> None:
+    timestamps = minute_timestamps(365)
+
+    split = latest_purged_split(timestamps, gap_minutes=1_440)
+
+    assert timestamps[split.test.stop - 1] == timestamps[-1]
+    assert timestamps[split.train.stop - 1] < timestamps[split.validation.start]
+    assert split.train.stop > 60 * 24 * 60
+    validate_time_split(timestamps, split, gap_minutes=1_440)
+
+
+def test_explicit_split_rejects_overlap_wrong_order_and_missing_purge_gap() -> None:
+    timestamps = minute_timestamps(120)
+    overlapping = TimeSplit(
+        train=IndexRange(0, 20),
+        validation=IndexRange(10, 24),
+        calibration=IndexRange(25, 30),
+        test=IndexRange(31, 36),
+    )
+    unpurged = TimeSplit(
+        train=IndexRange(0, 40),
+        validation=IndexRange(40, 50),
+        calibration=IndexRange(50, 60),
+        test=IndexRange(60, 70),
+    )
+
+    with pytest.raises(ValueError, match="strictly chronological and disjoint"):
+        validate_time_split(timestamps, overlapping, gap_minutes=1)
+    with pytest.raises(ValueError, match="purge gap"):
+        validate_time_split(timestamps, unpurged, gap_minutes=1_440)
