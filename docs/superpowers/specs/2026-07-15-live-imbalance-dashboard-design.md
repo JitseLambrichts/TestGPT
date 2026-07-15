@@ -12,7 +12,7 @@ The dashboard succeeds when it:
 
 - opens at `GET /dashboard` from the existing API container;
 - shows the latest prediction and realized value without fixture or demo data;
-- plots predicted and realized MW for the last six hours, with the p10-p90 interval;
+- plots predicted and realized MW from six hours ago through the current one-minute forecast horizon, with the p10-p90 interval;
 - shows exact current values in summary cards;
 - lists recent predictions and marks the flip decision as correct, incorrect, or pending;
 - refreshes every 15 seconds without blanking previously loaded content;
@@ -86,7 +86,7 @@ Add an immutable dashboard row model containing the existing prediction fields p
 
 Add a bounded repository method that accepts UTC-aware `start`, `end`, and `limit`. It canonicalizes `predictions` and `prediction_outcomes` independently with `argMax`, then left-joins each canonical prediction to its canonical outcome by prediction event ID and target time. It returns rows in ascending target-time/event-ID order for charting. A missing outcome remains a valid row with nullable outcome fields.
 
-The query limit is restricted to 1-10,000 rows. The default browser request covers the preceding six hours with a limit sufficient for minute data. Query failures are translated through the existing `TransientStorageError` boundary.
+The query limit is restricted to 1-10,000 rows. The default browser request uses `start = now - 6 hours` and `end = now + 2 minutes`, with a limit sufficient for minute data. The small forward allowance ensures that the newest t+1 prediction is included despite clock skew, while still excluding anything outside the immediate forecast horizon. Query failures are translated through the existing `TransientStorageError` boundary.
 
 ### HTTP API
 
@@ -104,7 +104,7 @@ Static resources are resolved from the installed Python package rather than the 
 
 The browser code is split by responsibility even though it remains dependency-light:
 
-- data loading builds the rolling six-hour UTC request and owns the 15-second refresh timer;
+- data loading builds the rolling UTC request from six hours ago through two minutes ahead and owns the 15-second refresh timer;
 - view-model helpers format Brussels-local timestamps, MW values, probabilities, state labels, and result labels;
 - summary rendering derives cards from the newest row;
 - chart rendering creates one Chart.js instance and updates its datasets in place;
@@ -118,7 +118,7 @@ All API and asset requests are same-origin. The page performs an immediate reque
 - The API contract uses UTC timestamps. The dashboard displays them in `Europe/Brussels` with `Intl.DateTimeFormat`.
 - MW values use a sign and one decimal place. Errors are `predicted - realized`, preserving direction.
 - Probabilities are displayed as whole percentages while exact fractional data remains in the JSON contract.
-- The newest prediction supplies the forecast, probability, state, quality, and model-version cards.
+- The newest prediction supplies the forecast, probability, state, and quality cards, plus the model-version label in the header.
 - The newest row with an outcome supplies the latest realized value and its matching prediction error. This avoids making a future prediction appear to have a realization already.
 - Predictions with equal target times remain separate by event ID; the repository preserves current event identity semantics rather than inventing client-side deduplication.
 - `prediction_quality="degraded"` is visibly marked amber. Other quality strings remain visible as provided by the backend.
