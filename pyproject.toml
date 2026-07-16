@@ -48,6 +48,7 @@ imbalance-api = "imbalance_pipeline.serving.api:main"
 imbalance-outcomes = "imbalance_pipeline.services.outcomes:main"
 imbalance-train = "imbalance_pipeline.training.train:main"
 imbalance-export = "imbalance_pipeline.training.export_data:main"
+imbalance-export-training = "imbalance_pipeline.training.export_clickhouse:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/imbalance_pipeline"]
