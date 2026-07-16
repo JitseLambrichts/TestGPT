@@ -67,7 +67,7 @@ Voor een gecontroleerde historische dag publiceert de ingestor de Elia-bronreeks
 make backfill START=2026-07-13T00:00:00Z END=2026-07-14T00:00:00Z
 ```
 
-De historische backfill gebruikt expliciet Elia ODS133 (ODS161 blijft de live bron). De periode is bewust op maximaal één dag begrensd. Herhaal per dag of orkestreer dit extern; herlevering is veilig. Exporteer daarna een point-in-time dataset en train met dezelfde packagecode:
+De historische backfill gebruikt expliciet Elia ODS133 (ODS161 blijft de live bron). De periode is bewust op maximaal één dag begrensd. Herhaal per dag of orkestreer dit extern; herlevering is veilig. Backfill bovendien minstens de volledige contextgeschiedenis vóór de eerste exportdag, anders kan de exporter de eerste voorbeelden niet causaal opbouwen. Exporteer daarna een point-in-time dataset en train met dezelfde packagecode:
 
 ```bash
 make export-training START=2026-07-13T00:00:00Z END=2026-07-14T00:00:00Z OUTPUT=exports/imbalance-2026-07-13

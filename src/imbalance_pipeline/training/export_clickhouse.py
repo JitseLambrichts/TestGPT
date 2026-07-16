@@ -76,7 +76,7 @@ async def export_clickhouse_training_dataset(
     missing = sorted(expected.difference(values))
     if missing:
         raise ValueError(
-            "insufficient contiguous imbalance history for the 180-minute local window"
+            "insufficient contiguous imbalance history for the local and context windows"
         )
 
     initial_seed = await repository.fetch_imbalance_state_seed(

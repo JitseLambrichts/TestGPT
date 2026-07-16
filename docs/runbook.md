@@ -23,7 +23,7 @@ Gebruik voor een gecontroleerde historische replay `make backfill START=… END=
 
 ## Historische training
 
-Backfill historische imbalance-data uit ODS133 (ODS161 is uitsluitend de live bron), exporteer daarna point-in-time voorbeelden en train een kandidaatbundle:
+Backfill historische imbalance-data uit ODS133 (ODS161 is uitsluitend de live bron). Backfill minstens de volledige contextgeschiedenis vóór de eerste exportdag; exporteer daarna point-in-time voorbeelden en train een kandidaatbundle:
 
 ```bash
 make backfill START=2026-07-13T00:00:00Z END=2026-07-14T00:00:00Z
