@@ -182,6 +182,30 @@ async def test_poll_imbalance_publishes_every_delivery_with_one_deterministic_id
 
 
 @pytest.mark.asyncio
+async def test_poll_imbalance_uses_history_dataset_for_explicit_backfill_window() -> None:
+    client = FakeEliaClient()
+    bus = InMemoryEventBus()
+    ingestor = make_ingestor(client, bus)
+
+    await ingestor.poll_imbalance_once(
+        start=datetime(2026, 7, 13, 0, tzinfo=UTC),
+        end=datetime(2026, 7, 13, 1, tzinfo=UTC),
+    )
+
+    assert client.calls[0][0] == "ods133"
+
+
+@pytest.mark.asyncio
+async def test_poll_imbalance_uses_live_dataset_without_explicit_window() -> None:
+    client = FakeEliaClient()
+    bus = InMemoryEventBus()
+
+    await make_ingestor(client, bus).poll_imbalance_once()
+
+    assert client.calls[0][0] == "ods161"
+
+
+@pytest.mark.asyncio
 async def test_poll_imbalance_gives_a_changed_source_payload_a_new_revision_identity() -> None:
     original = fixture_records("ods161")[0]
     corrected = {**original, "systemimbalance": 326.0}

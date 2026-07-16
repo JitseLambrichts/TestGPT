@@ -129,7 +129,11 @@ class Ingestor:
         end: datetime | None = None,
     ) -> int:
         return await self._poll_elia_once(
-            dataset=self._settings.elia_imbalance_live_dataset,
+            dataset=(
+                self._settings.elia_imbalance_history_dataset
+                if start is not None or end is not None
+                else self._settings.elia_imbalance_live_dataset
+            ),
             subject=Subject.RAW_ELIA_IMBALANCE,
             event_type="elia.imbalance.observed",
             build_event=_build_imbalance_event,
