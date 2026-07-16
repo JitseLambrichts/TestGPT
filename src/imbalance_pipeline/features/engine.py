@@ -299,13 +299,15 @@ class FeatureEngine:
     async def open_replay(
         self,
         *,
+        start: datetime = REPLAY_START,
         end: datetime,
         knowledge_cutoff: datetime,
     ) -> FeatureReplaySession:
+        replay_start = _utc(start)
         replay_end = _utc(end)
         replay_knowledge_cutoff = _utc(knowledge_cutoff)
         versions = await self._source.fetch_imbalance_versions(
-            REPLAY_START,
+            replay_start,
             replay_end,
             knowledge_cutoff=replay_knowledge_cutoff,
         )

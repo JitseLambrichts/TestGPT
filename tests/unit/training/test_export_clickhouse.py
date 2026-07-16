@@ -44,8 +44,39 @@ async def test_empty_input_raises_and_does_not_create_output(tmp_path):
     assert not (tmp_path / "dataset").exists()
 
 
+@pytest.mark.asyncio
+async def test_failure_preserves_existing_output(tmp_path):
+    class Repository:
+        async def fetch_imbalance_versions(self, *args, **kwargs):
+            return []
+
+    output = tmp_path / "dataset"
+    output.write_text("caller-owned", encoding="utf-8")
+    with pytest.raises(ValueError, match="no usable"):
+        await export_clickhouse_training_dataset(
+            Repository(), output, datetime(2025, 1, 1, tzinfo=UTC), datetime(2025, 1, 2, tzinfo=UTC)
+        )
+    assert output.read_text(encoding="utf-8") == "caller-owned"
+
+
+@pytest.mark.asyncio
+async def test_rejects_gapped_local_history(tmp_path):
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    versions = _versions(start)
+    versions.pop(10)
+
+    class Repository:
+        async def fetch_imbalance_versions(self, *args, **kwargs):
+            return versions
+
+    with pytest.raises(ValueError, match="contiguous"):
+        await export_clickhouse_training_dataset(
+            Repository(), tmp_path / "dataset", start, start + timedelta(minutes=2)
+        )
+
+
 def _versions(start: datetime):
-    timestamps = [start - timedelta(minutes=180), start, start + timedelta(minutes=1)]
+    timestamps = [start + timedelta(minutes=offset) for offset in range(-180, 3)]
     return [
         SimpleNamespace(
             observation=SimpleNamespace(timestamp=timestamp, system_imbalance_mw=float(index)),

@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import shutil
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,11 +43,6 @@ def _canonical_values(versions: Sequence[VersionedImbalanceObservation]) -> dict
     }
 
 
-def _remove_output(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path) if path.is_dir() else path.unlink()
-
-
 async def export_clickhouse_training_dataset(
     repository: Any,
     output: Path,
@@ -73,28 +67,36 @@ async def export_clickhouse_training_dataset(
     cutoffs = sorted(timestamp for timestamp in values if start <= timestamp < end)
     if not cutoffs:
         raise ValueError("no usable imbalance observations in requested range")
-    if min(values) > history_start:
-        raise ValueError("insufficient imbalance history for the 180-minute local window")
+    required_end = max(cutoffs) + timedelta(minutes=1)
+    expected = {
+        history_start + timedelta(minutes=offset)
+        for offset in range(int((required_end - history_start).total_seconds() // 60) + 1)
+    }
+    missing = sorted(expected.difference(values))
+    if missing:
+        raise ValueError(
+            "insufficient contiguous imbalance history for the 180-minute local window"
+        )
 
     registry = FeatureRegistry.default(deadband_mw=deadband_mw)
     engine = FeatureEngine(repository, registry)
-    replay = await engine.open_replay(end=end, knowledge_cutoff=end)
+    replay = await engine.open_replay(
+        start=history_start,
+        end=end,
+        knowledge_cutoff=end,
+    )
     examples = []
-    try:
-        for offset in range(0, len(cutoffs), batch_size):
-            batch = cutoffs[offset : offset + batch_size]
-            snapshots: list[FeatureSnapshot] = await engine.build_many(
-                batch,
-                knowledge_cutoffs=batch,
-                replay=replay,
-            )
-            examples.extend(build_training_examples(snapshots, values, deadband_mw=deadband_mw))
-        if not examples:
-            raise ValueError("no usable training examples (observations lack next-minute targets)")
-        return write_training_dataset(examples, Path(output))
-    except Exception:
-        _remove_output(Path(output))
-        raise
+    for offset in range(0, len(cutoffs), batch_size):
+        batch = cutoffs[offset : offset + batch_size]
+        snapshots: list[FeatureSnapshot] = await engine.build_many(
+            batch,
+            knowledge_cutoffs=batch,
+            replay=replay,
+        )
+        examples.extend(build_training_examples(snapshots, values, deadband_mw=deadband_mw))
+    if not examples:
+        raise ValueError("no usable training examples (observations lack next-minute targets)")
+    return write_training_dataset(examples, Path(output))
 
 
 def _parse_iso(value: str) -> datetime:
