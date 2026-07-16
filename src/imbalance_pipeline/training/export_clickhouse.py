@@ -81,7 +81,7 @@ async def export_clickhouse_training_dataset(
 
     initial_seed = await repository.fetch_imbalance_state_seed(
         history_start - timedelta(minutes=1),
-        knowledge_cutoff=end,
+        knowledge_cutoff=cutoffs[0],
         deadband_mw=deadband_mw,
     )
 

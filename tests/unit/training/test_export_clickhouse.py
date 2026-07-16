@@ -91,14 +91,18 @@ def _versions(start: datetime):
 @pytest.mark.asyncio
 async def test_reuses_one_replay_and_passes_causal_knowledge_cutoffs(tmp_path, monkeypatch):
     start = datetime(2025, 1, 1, tzinfo=UTC)
-    calls = {"open": [], "build": []}
+    calls = {"open": [], "build": [], "seed": []}
 
     class Repository:
         async def fetch_imbalance_versions(self, *args, **kwargs):
             return _versions(start)
 
         async def fetch_imbalance_state_seed(self, *args, **kwargs):
-            return SimpleNamespace(state=None, state_since=None, last_observed_at=None)
+            calls["seed"].append(kwargs)
+            # A late revision would change this seed after ``start``; the
+            # exporter must request the earliest cutoff's knowledge time.
+            state = "positive" if kwargs["knowledge_cutoff"] <= start else "negative"
+            return SimpleNamespace(state=state, state_since=start, last_observed_at=start)
 
     class Engine:
         def __init__(self, repository, registry):
@@ -132,6 +136,8 @@ async def test_reuses_one_replay_and_passes_causal_knowledge_cutoffs(tmp_path, m
     )
     assert result == output
     assert len(calls["open"]) == 1
+    assert calls["seed"][0]["knowledge_cutoff"] == start
+    assert calls["open"][0]["initial_seed"].state == "positive"
     assert calls["open"][0]["start"] < start - timedelta(minutes=180)
     assert len(calls["build"]) == 2
     assert calls["build"][0][1] == [start]
