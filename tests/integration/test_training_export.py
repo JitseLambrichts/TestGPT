@@ -41,9 +41,9 @@ async def test_clickhouse_export_writes_verified_causal_dataset(tmp_path) -> Non
     end = start + timedelta(minutes=2)
     values: dict[datetime, float] = {}
     try:
-        # 180 minutes of local history, the two requested cutoffs, and the
-        # final next-minute target required to build both labels.
-        for offset in range(-180, 3):
+        # Full context history (96 quarter-hour steps), local history, the two
+        # requested cutoffs, and the final next-minute target for both labels.
+        for offset in range(-1440, 3):
             timestamp = start + timedelta(minutes=offset)
             value = float(offset * 2 + 25)
             values[timestamp] = value

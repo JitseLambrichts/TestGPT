@@ -10,9 +10,9 @@ from typing import Any
 from imbalance_pipeline.config import get_settings
 from imbalance_pipeline.domain.imbalance import VersionedImbalanceObservation
 from imbalance_pipeline.features.engine import (
-    LOCAL_HISTORY_MINUTES,
     FeatureEngine,
     FeatureSnapshot,
+    _history_times,
 )
 from imbalance_pipeline.features.schema import FeatureRegistry
 from imbalance_pipeline.storage.clickhouse import ClickHouseRepository
@@ -59,7 +59,8 @@ async def export_clickhouse_training_dataset(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
-    history_start = start - timedelta(minutes=LOCAL_HISTORY_MINUTES)
+    registry = FeatureRegistry.default(deadband_mw=deadband_mw)
+    history_start = _history_times(start, registry)[0]
     versions = await repository.fetch_imbalance_versions(
         history_start, end, knowledge_cutoff=end
     )
@@ -78,7 +79,6 @@ async def export_clickhouse_training_dataset(
             "insufficient contiguous imbalance history for the 180-minute local window"
         )
 
-    registry = FeatureRegistry.default(deadband_mw=deadband_mw)
     engine = FeatureEngine(repository, registry)
     replay = await engine.open_replay(
         start=history_start,

@@ -76,7 +76,7 @@ async def test_rejects_gapped_local_history(tmp_path):
 
 
 def _versions(start: datetime):
-    timestamps = [start + timedelta(minutes=offset) for offset in range(-180, 3)]
+    timestamps = [start + timedelta(minutes=offset) for offset in range(-1440, 3)]
     return [
         SimpleNamespace(
             observation=SimpleNamespace(timestamp=timestamp, system_imbalance_mw=float(index)),
@@ -129,6 +129,7 @@ async def test_reuses_one_replay_and_passes_causal_knowledge_cutoffs(tmp_path, m
     )
     assert result == output
     assert len(calls["open"]) == 1
+    assert calls["open"][0]["start"] < start - timedelta(minutes=180)
     assert len(calls["build"]) == 2
     assert calls["build"][0][1] == [start]
     assert calls["build"][1][1] == [start + timedelta(minutes=1)]
