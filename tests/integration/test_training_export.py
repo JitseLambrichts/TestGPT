@@ -4,7 +4,7 @@ import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from test_clickhouse import event, migrated_client
+from test_clickhouse import DATABASE, event, migrated_client
 
 from imbalance_pipeline.storage.clickhouse import ClickHouseRepository
 from imbalance_pipeline.training.export_clickhouse import export_clickhouse_training_dataset
@@ -28,10 +28,15 @@ pytestmark = [
 ]
 
 
+def training_event(**kwargs):
+    """Build a historical ODS133 event (the shared helper defaults to ODS161)."""
+    return event(**kwargs).model_copy(update={"dataset": "ods133"})
+
+
 @pytest.mark.asyncio
 async def test_clickhouse_export_writes_verified_causal_dataset(tmp_path) -> None:
     client = await migrated_client()
-    repository = ClickHouseRepository(client, database="imbalance")
+    repository = ClickHouseRepository(client, database=DATABASE)
     start = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
     end = start + timedelta(minutes=2)
     values: dict[datetime, float] = {}
@@ -45,14 +50,14 @@ async def test_clickhouse_export_writes_verified_causal_dataset(tmp_path) -> Non
             ingested_at = timestamp + timedelta(seconds=5)
             if timestamp == start + timedelta(minutes=2):
                 ingested_at = end - timedelta(seconds=1)
-            await repository.insert_event(
-                event(
-                    event_id=f"training-export-{offset}",
-                    event_time=timestamp,
-                    ingested_at=ingested_at,
-                    value=value,
-                )
+            source = training_event(
+                event_id=f"training-export-{offset}",
+                event_time=timestamp,
+                ingested_at=ingested_at,
+                value=value,
             )
+            assert source.dataset == "ods133"
+            await repository.insert_event(source)
 
         output = await export_clickhouse_training_dataset(
             repository, tmp_path / "dataset", start, end
