@@ -97,6 +97,9 @@ async def test_reuses_one_replay_and_passes_causal_knowledge_cutoffs(tmp_path, m
         async def fetch_imbalance_versions(self, *args, **kwargs):
             return _versions(start)
 
+        async def fetch_imbalance_state_seed(self, *args, **kwargs):
+            return SimpleNamespace(state=None, state_since=None, last_observed_at=None)
+
     class Engine:
         def __init__(self, repository, registry):
             del repository, registry
@@ -156,6 +159,9 @@ async def test_excludes_future_observations_from_feature_knowledge_cutoff(tmp_pa
     class Repository:
         async def fetch_imbalance_versions(self, *args, **kwargs):
             return observed
+
+        async def fetch_imbalance_state_seed(self, *args, **kwargs):
+            return SimpleNamespace(state=None, state_since=None, last_observed_at=None)
 
     class Engine:
         def __init__(self, repository, registry):

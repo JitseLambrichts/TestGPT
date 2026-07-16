@@ -280,6 +280,30 @@ async def test_replay_session_shares_one_version_stream_across_training_batches(
 
 
 @pytest.mark.asyncio
+async def test_bounded_replay_preserves_state_seed_before_replay_start() -> None:
+    source = MemoryFeatureSource([])
+    engine = FeatureEngine(source, DEFAULT_FEATURE_REGISTRY)
+    seed = ConfirmedStateSeed(
+        state=ConfirmedState.POSITIVE,
+        state_since=CUTOFF - timedelta(minutes=2_000),
+        last_observed_at=CUTOFF - timedelta(minutes=1_500),
+    )
+    replay = await engine.open_replay(
+        start=CUTOFF - timedelta(minutes=1_440),
+        end=CUTOFF,
+        knowledge_cutoff=KNOWLEDGE_CUTOFF,
+        initial_seed=seed,
+    )
+
+    (snapshot,) = await engine.build_many(
+        [CUTOFF], knowledge_cutoffs=[KNOWLEDGE_CUTOFF], replay=replay
+    )
+
+    assert snapshot.current_state is ConfirmedState.POSITIVE
+    assert snapshot.local_masks[-1, 0] == 0
+
+
+@pytest.mark.asyncio
 async def test_build_many_replays_late_corrections_before_the_local_window() -> None:
     timestamp = CUTOFF - timedelta(minutes=2_000)
     original = VersionedObservation(

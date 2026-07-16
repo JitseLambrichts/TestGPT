@@ -79,11 +79,18 @@ async def export_clickhouse_training_dataset(
             "insufficient contiguous imbalance history for the 180-minute local window"
         )
 
+    initial_seed = await repository.fetch_imbalance_state_seed(
+        history_start - timedelta(minutes=1),
+        knowledge_cutoff=end,
+        deadband_mw=deadband_mw,
+    )
+
     engine = FeatureEngine(repository, registry)
     replay = await engine.open_replay(
         start=history_start,
         end=end,
         knowledge_cutoff=end,
+        initial_seed=initial_seed,
     )
     examples = []
     for offset in range(0, len(cutoffs), batch_size):

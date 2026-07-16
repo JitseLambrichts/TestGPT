@@ -152,10 +152,12 @@ class FeatureReplaySession:
         *,
         end: datetime,
         knowledge_cutoff: datetime,
+        initial_seed: ConfirmedStateSeed | None = None,
     ) -> None:
         self._engine = engine
         self._end = end
         self._knowledge_cutoff = knowledge_cutoff
+        self._initial_seed = initial_seed
         timestamps = tuple(sorted({_utc(version.observation.timestamp) for version in versions}))
         self._state_replay = _StateReplay(timestamps, engine._registry.deadband_mw)
         self._versions = tuple(
@@ -199,6 +201,8 @@ class FeatureReplaySession:
             self._advance_to(known_at)
             history_times = _history_times(cutoff, self._engine._registry)
             state_seed = self._state_replay.seed_before(history_times[0], self._observations)
+            if state_seed.last_observed_at is None and self._initial_seed is not None:
+                state_seed = self._initial_seed
             history_observations = [
                 self._observations[timestamp]
                 for timestamp in history_times
@@ -302,6 +306,7 @@ class FeatureEngine:
         start: datetime = REPLAY_START,
         end: datetime,
         knowledge_cutoff: datetime,
+        initial_seed: ConfirmedStateSeed | None = None,
     ) -> FeatureReplaySession:
         replay_start = _utc(start)
         replay_end = _utc(end)
@@ -316,6 +321,7 @@ class FeatureEngine:
             versions,
             end=replay_end,
             knowledge_cutoff=replay_knowledge_cutoff,
+            initial_seed=initial_seed,
         )
 
     def _transform(
