@@ -1,10 +1,12 @@
 import argparse
 import hashlib
 import json
+import logging
 import math
 import os
 import random
 import shutil
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -41,6 +43,8 @@ from imbalance_pipeline.training.splits import (
     latest_purged_split,
     validate_time_split,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,17 +153,27 @@ def train_ensemble(
     dataset = open_training_dataset(dataset_path)
     timestamps = dataset.cutoffs()
     _require_unique_timestamps(timestamps)
+    LOGGER.info("loaded dataset with %d examples", len(timestamps))
     split = _resolve_split(timestamps, config)
     training = _Partition(dataset, split.train)
     validation = _Partition(dataset, split.validation)
     calibration = _Partition(dataset, split.calibration)
     test = _Partition(dataset, split.test)
+    LOGGER.info(
+        "split resolved: train=%d validation=%d calibration=%d test=%d",
+        training.count,
+        validation.count,
+        calibration.count,
+        test.count,
+    )
     preprocessor = RobustPreprocessor.fit_stream(training.examples())
     device = _device(config.device)
+    LOGGER.info("fitted preprocessor, training on device=%s", device)
     results = tuple(
         _train_member(seed, training, validation, preprocessor, config, device)
         for seed in config.seeds
     )
+    LOGGER.info("finished training all %d ensemble members", len(results))
     calibration_prediction = _ensemble_predictions(
         results,
         calibration,
@@ -168,6 +182,7 @@ def train_ensemble(
         device,
     )
     calibrator = _fit_calibrator(calibration_prediction)
+    LOGGER.info("fitted flip-probability calibrator")
     test_prediction = _ensemble_predictions(
         results,
         test,
@@ -177,6 +192,7 @@ def train_ensemble(
     )
     candidate_report = _evaluation_report(test_prediction, calibrator)
     baseline_reports = _baseline_reports(training, test, test_prediction)
+    LOGGER.info("evaluated candidate against baselines, writing bundle")
     return _write_candidate(
         output_dir,
         results,
@@ -231,7 +247,9 @@ def _train_member(
     best_state: dict[str, Tensor] | None = None
     stalled_epochs = 0
     completed_epochs = 0
+    LOGGER.info("seed %d: starting training for up to %d epochs", seed, config.epochs)
     for epoch in range(config.epochs):
+        epoch_started = time.monotonic()
         _set_learning_rate(optimizer, config, epoch)
         model.train()
         for examples in training.batches(config.batch_size, seed=seed + epoch):
@@ -258,7 +276,8 @@ def _train_member(
             device,
         )
         completed_epochs = epoch + 1
-        if validation_loss < best_loss:
+        improved = validation_loss < best_loss
+        if improved:
             best_loss = validation_loss
             best_state = {
                 name: value.detach().cpu().clone() for name, value in model.state_dict().items()
@@ -266,11 +285,32 @@ def _train_member(
             stalled_epochs = 0
         else:
             stalled_epochs += 1
-            if stalled_epochs >= config.early_stopping_patience:
-                break
+        LOGGER.info(
+            "seed %d: epoch %d/%d validation_loss=%.6f best=%.6f%s (%.1fs)",
+            seed,
+            completed_epochs,
+            config.epochs,
+            validation_loss,
+            best_loss,
+            " *" if improved else f" stalled={stalled_epochs}",
+            time.monotonic() - epoch_started,
+        )
+        if stalled_epochs >= config.early_stopping_patience:
+            LOGGER.info(
+                "seed %d: early stopping after %d epochs without improvement",
+                seed,
+                stalled_epochs,
+            )
+            break
     if best_state is None:
         raise ValueError(f"training did not produce a finite validation result for seed {seed}")
     model.load_state_dict(best_state)
+    LOGGER.info(
+        "seed %d: finished after %d epochs, best_validation_loss=%.6f",
+        seed,
+        completed_epochs,
+        best_loss,
+    )
     return _MemberResult(
         seed=seed,
         model=model,
@@ -841,6 +881,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train and export an imbalance ensemble bundle.")
     parser.add_argument("dataset", type=Path)
     parser.add_argument("output", type=Path)
