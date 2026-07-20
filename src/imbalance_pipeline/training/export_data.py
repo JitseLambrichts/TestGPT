@@ -3,7 +3,7 @@ import json
 import os
 import shutil
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import chain, islice
 from pathlib import Path
@@ -30,7 +30,9 @@ class TrainingShard:
 class TrainingDataset:
     root: Path
     feature_schema_hash: str
+    dataset_digest: str
     shards: tuple[TrainingShard, ...]
+    _verified_shards: set[str] = field(default_factory=set, repr=False, compare=False)
 
     @property
     def count(self) -> int:
@@ -39,10 +41,10 @@ class TrainingDataset:
     def cutoffs(self) -> list[datetime]:
         values: list[datetime] = []
         for shard in self.shards:
+            self._verify_shard(shard)
             values.extend(
                 _load_shard_cutoffs(
                     self.root / shard.name,
-                    expected_checksum=shard.checksum,
                     expected_count=shard.count,
                 )
             )
@@ -65,11 +67,11 @@ class TrainingDataset:
             stop = min(section.stop, shard_stop)
             if start >= stop:
                 continue
+            self._verify_shard(shard)
             yield from _load_shard_indices(
                 self.root / shard.name,
                 self.feature_schema_hash,
                 range(start - shard_start, stop - shard_start),
-                expected_checksum=shard.checksum,
             )
 
     def iter_batches(
@@ -96,6 +98,7 @@ class TrainingDataset:
         batch: list[TrainingExample] = []
         for chunk_index in order:
             shard, start, stop = chunks[int(chunk_index)]
+            self._verify_shard(shard)
             indices = np.arange(start, stop)
             if seed is not None:
                 generator.shuffle(indices)
@@ -103,7 +106,6 @@ class TrainingDataset:
                 self.root / shard.name,
                 self.feature_schema_hash,
                 indices.tolist(),
-                expected_checksum=shard.checksum,
             ):
                 batch.append(example)
                 if len(batch) == batch_size:
@@ -111,6 +113,15 @@ class TrainingDataset:
                     batch = []
         if batch:
             yield batch
+
+    def _verify_shard(self, shard: TrainingShard) -> None:
+        """Verify each immutable shard once for this opened training run."""
+        if shard.name in self._verified_shards:
+            return
+        path = self.root / shard.name
+        if _sha256(path) != shard.checksum:
+            raise ValueError(f"checksum mismatch for training dataset shard {path.name}")
+        self._verified_shards.add(shard.name)
 
 
 def write_training_dataset(
@@ -171,6 +182,7 @@ def write_training_dataset(
             "min_cutoff": minimum.isoformat(),
             "shards": shards,
         }
+        metadata["dataset_digest"] = _dataset_digest(metadata)
         (temporary / "metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
             encoding="utf-8",
@@ -212,9 +224,17 @@ def open_training_dataset(dataset: Path) -> TrainingDataset:
     shard_count = sum(shard.count for shard in shards)
     if not isinstance(expected_count, int) or expected_count != shard_count:
         raise ValueError("training dataset count does not match metadata")
+    computed_digest = _dataset_digest(metadata)
+    declared_digest = metadata.get("dataset_digest")
+    if declared_digest is not None and declared_digest != computed_digest:
+        raise ValueError("training dataset metadata digest does not match shard manifest")
     return TrainingDataset(
         root=root,
         feature_schema_hash=schema_hash,
+        # Dataset v1 exports predate this field. Their shard checksums are still
+        # part of the canonical digest, so retain read compatibility while every
+        # newly written export persists the digest explicitly.
+        dataset_digest=computed_digest,
         shards=tuple(shards),
     )
 
@@ -258,11 +278,8 @@ def _load_shard(path: Path, schema_hash: str) -> list[TrainingExample]:
 def _load_shard_cutoffs(
     path: Path,
     *,
-    expected_checksum: str,
     expected_count: int,
 ) -> list[datetime]:
-    if _sha256(path) != expected_checksum:
-        raise ValueError(f"checksum mismatch for training dataset shard {path.name}")
     try:
         with np.load(path, allow_pickle=False) as values:
             cutoffs = np.asarray(values["cutoff"])
@@ -277,11 +294,7 @@ def _load_shard_indices(
     path: Path,
     schema_hash: str,
     indices: Sequence[int] | None,
-    *,
-    expected_checksum: str | None = None,
 ) -> Iterator[TrainingExample]:
-    if expected_checksum is not None and _sha256(path) != expected_checksum:
-        raise ValueError(f"checksum mismatch for training dataset shard {path.name}")
     try:
         with np.load(path, allow_pickle=False) as values:
             arrays = {name: np.asarray(values[name]) for name in values.files}
@@ -354,6 +367,13 @@ def _metadata(root: Path) -> dict[str, object]:
     return value
 
 
+def _dataset_digest(metadata: dict[str, object]) -> str:
+    """Hash canonical dataset metadata, including every declared shard checksum."""
+    canonical = {key: value for key, value in metadata.items() if key != "dataset_digest"}
+    encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _shared_schema(examples: Sequence[TrainingExample]) -> str:
     schemas = {example.feature_schema_hash for example in examples}
     if len(schemas) != 1:
@@ -404,7 +424,11 @@ def _utc_datetime(value: str) -> datetime:
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1_048_576):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def main() -> None:

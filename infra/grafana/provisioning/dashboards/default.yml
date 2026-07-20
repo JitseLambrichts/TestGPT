@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: imbalance-pipeline
+    orgId: 1
+    folder: Imbalance Pipeline
+    type: file
+    disableDeletion: true
+    editable: false
+    options:
+      path: /var/lib/grafana/dashboards

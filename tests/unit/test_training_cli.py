@@ -11,6 +11,16 @@ def test_export_training_console_script_points_to_clickhouse_exporter() -> None:
     )
 
 
+def test_csv_training_console_script_and_make_workflow_are_available() -> None:
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+
+    assert 'imbalance-export-csv = "imbalance_pipeline.training.export_csv:main"' in pyproject
+    assert "train-csv:" in makefile
+    assert "imbalance-export-csv" in makefile
+    assert "imbalance-train" in makefile
+
+
 def test_make_export_training_requires_utc_window_and_forwards_arguments() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     assert "export-training" in makefile

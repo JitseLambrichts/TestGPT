@@ -10,6 +10,7 @@ from imbalance_pipeline.storage.migrate import (
     MANAGED_MIGRATIONS,
     MigrationChecksumError,
     MigrationLocked,
+    _execute_sql,
     apply_migrations,
 )
 
@@ -213,3 +214,21 @@ def test_wheel_configuration_includes_sql_migrations_as_package_resources() -> N
     assert configuration["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"] == {
         "infra/clickhouse": "imbalance_pipeline/storage/sql_migrations"
     }
+
+
+@pytest.mark.asyncio
+async def test_runner_accepts_the_docker_xml_user_grant_limitation() -> None:
+    client = FakeMigrationClient()
+
+    async def readonly_grant(statement: str) -> None:
+        if statement.startswith("GRANT "):
+            raise ClickHouseError("ACCESS_STORAGE_READONLY")
+        client.commands.append(statement)
+
+    client.command = readonly_grant  # type: ignore[method-assign]
+
+    await _execute_sql(
+        client, "CREATE TABLE demo.example (id UInt8); GRANT SELECT ON demo.* TO demo;"
+    )
+
+    assert client.commands == ["CREATE TABLE demo.example (id UInt8)"]

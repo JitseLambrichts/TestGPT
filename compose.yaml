@@ -1,0 +1,189 @@
+name: imbalance
+
+x-app: &app
+  build:
+    context: .
+  environment:
+    IMBALANCE_NATS_URL: ${IMBALANCE_NATS_URL:-nats://nats:4222}
+    IMBALANCE_CLICKHOUSE_URL: ${IMBALANCE_CLICKHOUSE_URL:-http://clickhouse:8123}
+    IMBALANCE_CLICKHOUSE_DATABASE: ${IMBALANCE_CLICKHOUSE_DATABASE:-imbalance}
+    IMBALANCE_CLICKHOUSE_USER: ${IMBALANCE_CLICKHOUSE_USER:-imbalance}
+    IMBALANCE_CLICKHOUSE_PASSWORD: ${IMBALANCE_CLICKHOUSE_PASSWORD:-imbalance}
+    IMBALANCE_ELIA_BASE_URL: ${IMBALANCE_ELIA_BASE_URL:-https://opendata.elia.be/api/explore/v2.1}
+    IMBALANCE_FLIP_DEADBAND_MW: ${IMBALANCE_FLIP_DEADBAND_MW:-10.0}
+    IMBALANCE_MODEL_DIR: /models/production
+    IMBALANCE_ALLOW_FALLBACK: ${IMBALANCE_ALLOW_FALLBACK:-true}
+    IMBALANCE_METRICS_PORT: ${IMBALANCE_METRICS_PORT:-9100}
+  init: true
+  read_only: true
+  restart: unless-stopped
+  mem_limit: 1g
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 30s
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+
+services:
+  nats:
+    image: nats:2.11-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/nats/nats.conf:/etc/nats/nats.conf:ro
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3-alpine
+    environment:
+      CLICKHOUSE_DB: ${IMBALANCE_CLICKHOUSE_DATABASE:-imbalance}
+      CLICKHOUSE_USER: ${IMBALANCE_CLICKHOUSE_USER:-imbalance}
+      CLICKHOUSE_PASSWORD: ${IMBALANCE_CLICKHOUSE_PASSWORD:-imbalance}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["imbalance-migrate"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+  ingestor:
+    <<: *app
+    command: ["imbalance-ingestor"]
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  sink:
+    <<: *app
+    command: ["imbalance-sink"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+
+  features:
+    <<: *app
+    command: ["imbalance-features"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+
+  predictor:
+    <<: *app
+    command: ["imbalance-predictor"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    volumes:
+      - ./models:/models:ro
+
+  outcomes:
+    <<: *app
+    command: ["imbalance-outcomes"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["imbalance-api"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${IMBALANCE_API_PORT:-8000}:8000"
+    volumes:
+      - ./models:/models:ro
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  trainer:
+    <<: *app
+    command: ["imbalance-train", "/data/dataset", "/models/candidate"]
+    profiles: ["training"]
+    restart: "no"
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    mem_limit: 6g
+
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    profiles: ["observability"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${IMBALANCE_PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${IMBALANCE_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${IMBALANCE_GRAFANA_ADMIN_PASSWORD:-change-me-before-exposure}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${IMBALANCE_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  clickhouse-data:
+  nats-data:
+  prometheus-data:
+  grafana-data:

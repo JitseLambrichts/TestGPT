@@ -1,0 +1,14 @@
+.git
+.worktrees
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+data
+models
+runs
+docs
+notebooks
+tests
+.env

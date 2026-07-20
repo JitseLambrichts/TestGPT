@@ -160,6 +160,20 @@ class Prediction(BaseModel):
         return self
 
 
+class DashboardRow(Prediction):
+    """Prediction enriched with its eventual realized outcome when available."""
+
+    realized_system_imbalance_mw: float | None = None
+    realized_state: str | None = None
+    flip_actual: bool | None = None
+    evaluated_at: datetime | None = None
+
+    @field_validator("evaluated_at")
+    @classmethod
+    def validate_optional_datetime(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _to_utc(value)
+
+
 class _FeatureSnapshotRecord(BaseModel):
     model_config = ConfigDict(extra="ignore", from_attributes=True)
 
@@ -402,6 +416,12 @@ PREDICTION_COLUMNS = (
     "feature_schema_hash",
     "row_version",
 )
+DASHBOARD_COLUMNS = PREDICTION_COLUMNS[:-1] + (
+    "realized_system_imbalance_mw",
+    "realized_state",
+    "flip_actual",
+    "evaluated_at",
+)
 OUTCOME_COLUMNS = (
     "prediction_event_id",
     "target_time",
@@ -509,9 +529,9 @@ class ClickHouseRepository:
             result = await self._client.query(
                 query,
                 parameters={
-                    "start": start,
-                    "event_cutoff": event_cutoff_utc,
-                    "knowledge_cutoff": knowledge_cutoff_utc,
+                    "start_64": start,
+                    "event_cutoff_64": event_cutoff_utc,
+                    "knowledge_cutoff_64": knowledge_cutoff_utc,
                 },
                 tz_mode="aware",
             )
@@ -557,9 +577,9 @@ class ClickHouseRepository:
             result = await self._client.query(
                 query,
                 parameters={
-                    "start": start_utc,
-                    "end": end_utc,
-                    "knowledge_cutoff": knowledge_cutoff_utc,
+                    "start_64": start_utc,
+                    "end_64": end_utc,
+                    "knowledge_cutoff_64": knowledge_cutoff_utc,
                 },
                 tz_mode="aware",
             )
@@ -593,8 +613,8 @@ class ClickHouseRepository:
         for index, (before, knowledge_cutoff) in enumerate(requests):
             before_utc = _to_utc(before)
             knowledge_cutoff_utc = _to_utc(knowledge_cutoff)
-            parameters[f"request_{index}_before"] = before_utc
-            parameters[f"request_{index}_knowledge_cutoff"] = knowledge_cutoff_utc
+            parameters[f"request_{index}_before_64"] = before_utc
+            parameters[f"request_{index}_knowledge_cutoff_64"] = knowledge_cutoff_utc
             request_queries.append(
                 f"""
                     SELECT
@@ -822,6 +842,123 @@ class ClickHouseRepository:
             predictions.append(Prediction.model_validate(values))
         return predictions
 
+    async def list_dashboard_rows(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[DashboardRow]:
+        if start.tzinfo is None or start.utcoffset() != UTC.utcoffset(start):
+            raise ValueError("dashboard range must be UTC-aware")
+        if end.tzinfo is None or end.utcoffset() != UTC.utcoffset(end):
+            raise ValueError("dashboard range must be UTC-aware")
+        start = _clickhouse_utc(start)
+        end = _clickhouse_utc(end)
+        if end < start:
+            raise ValueError("dashboard range end cannot precede start")
+        if limit <= 0 or limit > 10_000:
+            raise ValueError("dashboard row limit must be between 1 and 10000")
+        query = f"""
+            WITH canonical_predictions AS (
+                SELECT
+                    event_id,
+                    argMax(
+                        tuple(
+                            cutoff,
+                            target_time,
+                            generated_at,
+                            system_imbalance_mw,
+                            p10_mw,
+                            p90_mw,
+                            flip_probability,
+                            will_flip,
+                            current_state,
+                            predicted_state,
+                            prediction_quality,
+                            model_version,
+                            feature_schema_hash
+                        ),
+                        tuple(row_version, generated_at, event_id)
+                    ) AS versioned
+                FROM {self._database}.predictions
+                WHERE target_time >= {{start:DateTime64(3, 'UTC')}}
+                  AND target_time <= {{end:DateTime64(3, 'UTC')}}
+                GROUP BY event_id
+            ),
+            canonical_outcome_versions AS (
+                SELECT
+                    prediction_event_id,
+                    target_time,
+                    argMax(
+                        tuple(
+                            realized_system_imbalance_mw,
+                            realized_state,
+                            flip_actual,
+                            evaluated_at
+                        ),
+                        tuple(row_version, evaluated_at, realized_event_id)
+                    ) AS versioned
+                FROM {self._database}.prediction_outcomes
+                WHERE target_time >= {{start:DateTime64(3, 'UTC')}}
+                  AND target_time <= {{end:DateTime64(3, 'UTC')}}
+                GROUP BY prediction_event_id, target_time
+            ),
+            canonical_outcomes AS (
+                SELECT
+                    prediction_event_id,
+                    target_time,
+                    tupleElement(versioned, 1) AS realized_system_imbalance_mw,
+                    tupleElement(versioned, 2) AS realized_state,
+                    tupleElement(versioned, 3) AS flip_actual,
+                    tupleElement(versioned, 4) AS evaluated_at
+                FROM canonical_outcome_versions
+            )
+            SELECT
+                predictions.event_id,
+                tupleElement(predictions.versioned, 1) AS cutoff,
+                tupleElement(predictions.versioned, 2) AS target_time,
+                tupleElement(predictions.versioned, 3) AS generated_at,
+                tupleElement(predictions.versioned, 4) AS system_imbalance_mw,
+                tupleElement(predictions.versioned, 5) AS p10_mw,
+                tupleElement(predictions.versioned, 6) AS p90_mw,
+                tupleElement(predictions.versioned, 7) AS flip_probability,
+                tupleElement(predictions.versioned, 8) AS will_flip,
+                tupleElement(predictions.versioned, 9) AS current_state,
+                tupleElement(predictions.versioned, 10) AS predicted_state,
+                tupleElement(predictions.versioned, 11) AS prediction_quality,
+                tupleElement(predictions.versioned, 12) AS model_version,
+                tupleElement(predictions.versioned, 13) AS feature_schema_hash,
+                outcomes.realized_system_imbalance_mw,
+                outcomes.realized_state,
+                outcomes.flip_actual,
+                outcomes.evaluated_at
+            FROM canonical_predictions AS predictions
+            LEFT JOIN canonical_outcomes AS outcomes
+              ON outcomes.prediction_event_id = predictions.event_id
+             AND outcomes.target_time = tupleElement(predictions.versioned, 2)
+            ORDER BY target_time, event_id
+            LIMIT {{limit:UInt32}}
+            SETTINGS join_use_nulls = 1
+        """
+        try:
+            result = await self._client.query(
+                query,
+                parameters={"start": start, "end": end, "limit": limit},
+                tz_mode="aware",
+            )
+        except (ClickHouseError, OSError, TimeoutError) as exc:
+            raise TransientStorageError from exc
+        rows: list[DashboardRow] = []
+        for row in result.result_rows:
+            values = dict(zip(DASHBOARD_COLUMNS, row, strict=True))
+            for field_name in ("cutoff", "target_time", "generated_at", "evaluated_at"):
+                value = values[field_name]
+                if value is not None:
+                    values[field_name] = _clickhouse_utc(cast(datetime, value))
+            rows.append(DashboardRow.model_validate(values))
+        return rows
+
     async def fetch_predictions_for_target(self, target_time: datetime) -> list[Prediction]:
         target = _clickhouse_utc(target_time)
         query = f"""
@@ -866,13 +1003,12 @@ class ClickHouseRepository:
                 tupleElement(versioned, 12) AS model_version,
                 tupleElement(versioned, 13) AS feature_schema_hash
             FROM canonical
-            WHERE tupleElement(versioned, 3) <= {{target_time:DateTime64(3, 'UTC')}}
             ORDER BY event_id
         """
         try:
             result = await self._client.query(
                 query,
-                parameters={"target_time": target},
+                parameters={"target_time_64": target},
                 tz_mode="aware",
             )
         except (ClickHouseError, OSError, TimeoutError) as exc:

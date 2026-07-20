@@ -194,8 +194,11 @@ class OutcomeService:
         realized: ImbalanceObservation,
     ) -> list[EventEnvelope]:
         predictions = await self._repository.fetch_predictions_for_target(trigger.timestamp)
+        realization_available_at = trigger.source_ingested_at or trigger.timestamp
         eligible_predictions = [
-            prediction for prediction in predictions if prediction.generated_at <= trigger.timestamp
+            prediction
+            for prediction in predictions
+            if prediction.generated_at <= realization_available_at
         ]
         return [
             _outcome_event(

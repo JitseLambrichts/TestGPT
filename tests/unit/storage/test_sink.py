@@ -516,7 +516,8 @@ async def test_fetch_predictions_for_target_returns_each_canonical_prediction() 
     assert "GROUP BY event_id" in query
     assert "argMax(tuple(" in "".join(query.split())
     assert "FINAL" not in query.upper()
-    assert parameters == {"target_time": target}
+    assert "tupleElement(versioned, 3) <=" not in query
+    assert parameters == {"target_time_64": target}
     assert settings["tz_mode"] == "aware"
 
 
@@ -742,9 +743,9 @@ async def test_fetch_imbalance_window_uses_atomic_latest_aggregation_without_fin
     assert "FINAL" not in query.upper()
     assert "ingested_at <= {knowledge_cutoff:DateTime64(3, 'UTC')}" in query
     assert parameters == {
-        "start": event_cutoff - timedelta(minutes=180),
-        "event_cutoff": event_cutoff,
-        "knowledge_cutoff": knowledge_cutoff,
+        "start_64": event_cutoff - timedelta(minutes=180),
+        "event_cutoff_64": event_cutoff,
+        "knowledge_cutoff_64": knowledge_cutoff,
     }
     assert settings["tz_mode"] == "aware"
 
@@ -831,7 +832,11 @@ async def test_fetch_imbalance_versions_keeps_all_known_corrections_for_pit_read
     assert "FINAL" not in query.upper()
     assert "row_version" in query
     assert "ingested_at <= {knowledge_cutoff:DateTime64(3, 'UTC')}" in query
-    assert parameters == {"start": start, "end": end, "knowledge_cutoff": known_at}
+    assert parameters == {
+        "start_64": start,
+        "end_64": end,
+        "knowledge_cutoff_64": known_at,
+    }
     assert settings["tz_mode"] == "aware"
 
 
@@ -860,7 +865,8 @@ async def test_fetch_imbalance_state_seed_is_point_in_time_safe() -> None:
     assert "argMaxIf" in query
     assert "lagInFrame" in query
     assert "FINAL" not in query.upper()
-    assert parameters["request_0_before"] == before
+    assert parameters["request_0_before_64"] == before
+    assert parameters["request_0_knowledge_cutoff_64"] == known_at
     assert parameters["deadband_mw"] == 10.0
     assert settings["tz_mode"] == "aware"
 

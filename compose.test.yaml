@@ -1,0 +1,30 @@
+name: imbalance-test
+
+services:
+  fixture:
+    image: python:3.12-alpine
+    command: ["python", "/fixture/fixture_source.py"]
+    volumes:
+      - ./tests/e2e:/fixture:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  ingestor:
+    environment:
+      IMBALANCE_ELIA_BASE_URL: http://fixture:8080/api/explore/v2.1
+    depends_on:
+      fixture:
+        condition: service_healthy
+
+  predictor:
+    volumes: !override
+      - ./models/test:/models/production:ro
+
+  api:
+    ports: !override
+      - "18000:8000"
+    volumes: !override
+      - ./models/test:/models/production:ro

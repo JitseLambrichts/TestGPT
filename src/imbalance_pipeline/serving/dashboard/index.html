@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="nl">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Belgische netbalans</title>
+    <link rel="stylesheet" href="/dashboard-assets/dashboard.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#dashboard-content">Ga naar het dashboard</a>
+    <header class="topbar">
+      <div class="brand-lockup" aria-label="Belgische netbalans">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>Grid forecast</span>
+      </div>
+      <div class="status-cluster" aria-live="polite">
+        <span class="status-pill is-loading" id="live-status">
+          <span class="status-dot" aria-hidden="true"></span>
+          Laden
+        </span>
+        <span class="status-meta">Bijgewerkt <strong id="last-update">—</strong></span>
+        <button class="retry-button" id="retry-button" type="button" hidden>Opnieuw proberen</button>
+      </div>
+    </header>
+
+    <main id="dashboard-content">
+      <section class="intro" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Elia · België · t+1 minuut</p>
+          <h1 id="page-title">De volgende beweging van het net, helder in beeld.</h1>
+        </div>
+        <div class="model-lockup">
+          <span>Actief model</span>
+          <strong id="model-version">—</strong>
+        </div>
+      </section>
+
+      <section class="cards" aria-label="Actuele kernwaarden">
+        <article class="metric-card metric-card--primary">
+          <p>Verwachte netbalans</p>
+          <strong id="expected-value">—</strong>
+          <span id="expected-meta">Volgende minuut</span>
+        </article>
+        <article class="metric-card">
+          <p>Laatste werkelijke waarde</p>
+          <strong id="actual-value">—</strong>
+          <span id="actual-meta">Nog niet gekend</span>
+        </article>
+        <article class="metric-card">
+          <p>Voorspelfout</p>
+          <strong id="error-value">—</strong>
+          <span id="error-meta">In afwachting</span>
+        </article>
+        <article class="metric-card">
+          <p>Flipverwachting</p>
+          <strong id="flip-value">—</strong>
+          <span id="flip-meta">Kans en beslissing</span>
+        </article>
+        <article class="metric-card">
+          <p>Verwachte toestand</p>
+          <strong id="state-value">—</strong>
+          <span class="quality-badge" id="quality-value">—</span>
+        </article>
+      </section>
+
+      <section class="chart-panel" aria-labelledby="chart-title">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Laatste 6 uur</p>
+            <h2 id="chart-title">Voorspelling versus werkelijkheid</h2>
+          </div>
+          <div class="legend" aria-hidden="true">
+            <span><i class="legend-line legend-line--forecast"></i>Voorspeld</span>
+            <span><i class="legend-line legend-line--actual"></i>Werkelijk</span>
+            <span><i class="legend-band"></i>P10–P90</span>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="prediction-chart" role="img" aria-describedby="chart-summary"></canvas>
+        </div>
+        <p class="sr-only" id="chart-summary">De grafiek wordt geladen.</p>
+        <div class="empty-state" id="empty-state" hidden>
+          <strong>Nog geen live voorspellingen beschikbaar</strong>
+          <span>Zodra de pipeline een voorspelling opslaat, verschijnt ze hier automatisch.</span>
+        </div>
+      </section>
+
+      <section class="history-panel" aria-labelledby="history-title">
+        <div class="panel-heading panel-heading--table">
+          <div>
+            <p class="eyebrow">Controleerbaar per minuut</p>
+            <h2 id="history-title">Historische voorspellingen</h2>
+          </div>
+          <p id="row-count">0 resultaten</p>
+        </div>
+        <div class="table-scroll" tabindex="0" aria-label="Historische voorspellingen, horizontaal scrollbaar">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Doeltijd</th>
+                <th scope="col">Voorspeld</th>
+                <th scope="col">Werkelijk</th>
+                <th scope="col">Afwijking</th>
+                <th scope="col">Flipkans</th>
+                <th scope="col">Flip voorspeld</th>
+                <th scope="col">Flip werkelijk</th>
+                <th scope="col">Resultaat</th>
+              </tr>
+            </thead>
+            <tbody id="history-body">
+              <tr><td class="table-message" colspan="8">Live gegevens worden geladen.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <span>Informatief dashboard · geen trading- of dispatchadvies</span>
+        <span>Tijden in België · bron: live pipeline</span>
+      </footer>
+    </main>
+
+    <script src="/dashboard-assets/vendor/chart.umd.min.js"></script>
+    <script src="/dashboard-assets/dashboard.js"></script>
+  </body>
+</html>

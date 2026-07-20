@@ -1,0 +1,19 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0}, "id": 1, "targets": [{"expr": "sum(rate(imbalance_api_requests_total[5m]))", "refId": "A"}], "title": "API request rate", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0}, "id": 2, "targets": [{"expr": "sum(rate(imbalance_api_requests_total{status=~'5..'}[5m]))", "refId": "A"}], "title": "API 5xx rate", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0}, "id": 3, "targets": [{"expr": "imbalance_ingestor_published_total", "refId": "A"}], "title": "Elia source events", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8}, "id": 4, "targets": [{"expr": "imbalance_ingestor_source_errors_total", "refId": "A"}], "title": "Ingest failures", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8}, "id": 5, "targets": [{"expr": "nats_varz_connections", "refId": "A"}], "title": "NATS connections", "type": "timeseries"},
+    {"datasource": {"type": "prometheus", "uid": "prometheus"}, "fieldConfig": {"defaults": {}, "overrides": []}, "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8}, "id": 6, "targets": [{"expr": "up{job=~'imbalance-api|nats-monitoring'}", "refId": "A"}], "title": "Dependency up", "type": "stat"}
+  ],
+  "schemaVersion": 41,
+  "tags": ["imbalance", "elia", "nats", "clickhouse"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Realtime Imbalance Pipeline",
+  "uid": "imbalance-pipeline",
+  "version": 1
+}

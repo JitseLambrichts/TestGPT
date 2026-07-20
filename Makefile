@@ -1,9 +1,10 @@
 .DEFAULT_GOAL := help
+STRIDE ?= 30
 
-.PHONY: help up down clean test train export-training smoke backfill observability
+.PHONY: help up down clean test train train-csv export-training smoke backfill observability
 
 help:
-	@printf '%s\n' 'up: start the realtime pipeline' 'observability: start the pipeline plus Prometheus and Grafana' 'backfill: publish an explicit UTC day window (pass START=... END=...)' 'export-training: export a checksummed dataset (pass START=... END=... OUTPUT=...)' 'down: stop the pipeline' 'test: run unit tests' 'train: run the trainer profile (pass DATASET=... OUTPUT=...)' 'smoke: run the opt-in live Elia test' 'clean: remove local Docker volumes (requires CONFIRM_CLEAN=1)'
+	@printf '%s\n' 'up: start the realtime pipeline' 'observability: start the pipeline plus Prometheus and Grafana' 'backfill: publish an explicit UTC day window (pass START=... END=...)' 'export-training: export a checksummed dataset (pass START=... END=... OUTPUT=...)' 'train-csv: export ODS133 CSV and train (pass CSV=... DATASET=... OUTPUT=... [STRIDE=30])' 'down: stop the pipeline' 'test: run unit tests' 'train: run the trainer profile (pass DATASET=... OUTPUT=...)' 'smoke: run the opt-in live Elia test' 'clean: remove local Docker volumes (requires CONFIRM_CLEAN=1)'
 
 up:
 	docker compose up --build --detach
@@ -28,6 +29,10 @@ test:
 train:
 	@test -n "$(DATASET)" && test -n "$(OUTPUT)" || (echo "Set DATASET and OUTPUT" && exit 1)
 	docker compose --profile training run --rm trainer imbalance-train /data/$(DATASET) /models/$(OUTPUT)
+
+train-csv:
+	@test -n "$(CSV)" && test -n "$(DATASET)" && test -n "$(OUTPUT)" || (echo "Set CSV, DATASET, and OUTPUT" && exit 1)
+	docker compose --profile training run --rm trainer sh -c 'imbalance-export-csv "/data/$(CSV)" "/data/$(DATASET)" --stride-minutes "$(STRIDE)" && imbalance-train "/data/$(DATASET)" "/models/$(OUTPUT)"'
 
 export-training:
 	@test -n "$(START)" && test -n "$(END)" && test -n "$(OUTPUT)" || (echo "Set START, END, and OUTPUT as UTC ISO-8601 values" && exit 1)

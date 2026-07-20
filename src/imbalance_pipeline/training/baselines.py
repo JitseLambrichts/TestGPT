@@ -67,8 +67,8 @@ def classical_baseline(
 
 
 def _classical_flip_probability(
-    train_features: NDArray[np.float64],
-    evaluation_features: NDArray[np.float64],
+    train_features: NDArray[np.float32],
+    evaluation_features: NDArray[np.float32],
     flip_target: NDArray[np.int64],
     flip_mask: NDArray[np.bool_],
 ) -> NDArray[np.float64]:
@@ -93,9 +93,9 @@ def _training_reservoir(
     examples: Iterable[TrainingExample],
     *,
     max_examples: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int64], NDArray[np.bool_]]:
+) -> tuple[NDArray[np.float32], NDArray[np.float64], NDArray[np.int64], NDArray[np.bool_]]:
     generator = np.random.default_rng(17)
-    features: list[NDArray[np.float64]] = []
+    features: list[NDArray[np.float32]] = []
     target: list[float] = []
     flip_target: list[int] = []
     flip_mask: list[bool] = []
@@ -124,18 +124,18 @@ def _training_reservoir(
     )
 
 
-def _compact_features(examples: Iterable[TrainingExample]) -> NDArray[np.float64]:
+def _compact_features(examples: Iterable[TrainingExample]) -> NDArray[np.float32]:
     return _feature_matrix([_compact_example(example) for example in examples])
 
 
-def _feature_matrix(features: Sequence[NDArray[np.float64]]) -> NDArray[np.float64]:
-    matrix = np.asarray(features, dtype=np.float64)
+def _feature_matrix(features: Sequence[NDArray[np.float32]]) -> NDArray[np.float32]:
+    matrix = np.asarray(features, dtype=np.float32)
     if matrix.ndim != 2 or not np.isfinite(matrix).all():
         raise ValueError("baseline features must be finite and have matching shapes")
     return matrix
 
 
-def _compact_example(example: TrainingExample) -> NDArray[np.float64]:
+def _compact_example(example: TrainingExample) -> NDArray[np.float32]:
     summaries = (
         _summary(example.local_values, example.local_masks),
         _summary(example.context_values, example.context_masks),
@@ -147,26 +147,32 @@ def _compact_example(example: TrainingExample) -> NDArray[np.float64]:
 def _summary(
     values: NDArray[np.float32],
     masks: NDArray[np.uint8],
-) -> NDArray[np.float64]:
+) -> NDArray[np.float32]:
     if values.shape != masks.shape:
         raise ValueError("baseline feature values and masks must have matching shapes")
-    observed = np.asarray(values[masks == 1], dtype=np.float64)
-    if not len(observed):
-        return np.zeros(7, dtype=np.float64)
-    if not np.isfinite(observed).all():
+    if values.ndim == 0 or values.shape[-1] == 0:
+        raise ValueError("baseline feature tensors require at least one feature channel")
+    width = values.shape[-1]
+    flattened_values = np.asarray(values, dtype=np.float32).reshape(-1, width)
+    flattened_masks = np.asarray(masks, dtype=np.uint8).reshape(-1, width)
+    observed_values = flattened_values[flattened_masks == 1]
+    if not np.isfinite(observed_values).all():
         raise ValueError("observed baseline features must be finite")
-    return np.asarray(
-        (
+    # Keep every source channel separate: MW, prices, ages, flags and calendar
+    # inputs must never be pooled into a single synthetic baseline feature.
+    result = np.zeros((width, 5), dtype=np.float32)
+    for channel in range(width):
+        observed = flattened_values[flattened_masks[:, channel] == 1, channel]
+        if not len(observed):
+            continue
+        result[channel] = (
             observed[-1],
             np.mean(observed),
             np.std(observed),
-            np.min(observed),
-            np.max(observed),
-            np.median(observed),
             observed[-1] - observed[0],
-        ),
-        dtype=np.float64,
-    )
+            len(observed) / len(flattened_values),
+        )
+    return result.reshape(-1)
 
 
 def _observed_history(example: TrainingExample) -> NDArray[np.float64]:

@@ -12,6 +12,8 @@ from imbalance_pipeline.training.export_data import write_training_dataset
 from imbalance_pipeline.training.splits import IndexRange, TimeSplit
 from imbalance_pipeline.training.train import (
     TrainingConfig,
+    _cohort_masks,
+    _EnsemblePredictions,
     _resolve_split,
     _validation_objective,
     train_ensemble,
@@ -47,12 +49,46 @@ def test_train_ensemble_writes_three_seeded_onnx_members_and_evaluation(tmp_path
     assert [member["seed"] for member in evaluation["members"]] == [17, 29, 43]
     assert all(np.isfinite(member["best_validation_loss"]) for member in evaluation["members"])
     assert all((candidate / f"member-{index}.pt").is_file() for index in range(3))
-    assert {"persistence", "clipped_linear_drift", "rolling_median", "classical"} == set(
-        baselines
-    )
+    assert {"persistence", "clipped_linear_drift", "rolling_median", "classical"} == set(baselines)
     assert "current_positive" in evaluation["candidate"]["cohort_mae"]
     assert run_config["device"] == "cpu"
     assert run_config["split"]["test"] == {"start": 26, "stop": 32}
+    assert (
+        run_config["dataset"]["digest"]
+        == json.loads((dataset / "metadata.json").read_text())["dataset_digest"]
+    )
+
+
+def test_cohorts_cover_state_volatility_phase_and_source_quality() -> None:
+    prediction = _EnsemblePredictions(
+        predicted_mw=np.zeros(4),
+        p10_mw=np.zeros(4),
+        p90_mw=np.zeros(4),
+        raw_flip_probability=np.zeros(4),
+        actual_mw=np.zeros(4),
+        flip_target=np.zeros(4, dtype=np.int64),
+        flip_mask=np.ones(4, dtype=bool),
+        current_state=np.asarray([1, -1, 0, 1], dtype=np.int64),
+        volatility=np.asarray([1.0, 2.0, 3.0, 4.0]),
+        quarter_hour_phase=np.asarray([0, 5, 10, 14], dtype=np.int8),
+        source_quality=np.asarray([-1, 0, 1, 1], dtype=np.int8),
+    )
+
+    cohorts = _cohort_masks(prediction)
+
+    assert {"current_positive", "current_negative", "current_unknown"} <= set(cohorts)
+    assert {"low_volatility", "medium_volatility", "high_volatility"} <= set(cohorts)
+    phase_masks = [
+        cohorts["quarter_hour_phase_start"],
+        cohorts["quarter_hour_phase_middle"],
+        cohorts["quarter_hour_phase_end"],
+    ]
+    assert np.array_equal(np.sum(phase_masks, axis=0), np.ones(4, dtype=np.int64))
+    assert {
+        "source_quality_unknown",
+        "source_quality_unvalidated",
+        "source_quality_validated",
+    } <= set(cohorts)
 
 
 def test_trainer_resolves_default_at_the_latest_dataset_period_and_rejects_leakage() -> None:

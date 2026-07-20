@@ -1,9 +1,11 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import imbalance_pipeline.training.export_data as export_data
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.training.data import TrainingExample
 from imbalance_pipeline.training.export_data import (
@@ -68,6 +70,45 @@ def test_training_dataset_opens_shards_lazily_and_iterates_only_requested_rows(
         "zero",
     ]
     assert [len(batch) for batch in batches] == [2, 1]
+
+
+def test_training_dataset_caches_verified_shards_and_exposes_a_dataset_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = write_training_dataset(
+        [_example("zero", 0.0), _example("one", 1.0), _example("two", 2.0)],
+        tmp_path / "dataset",
+        shard_size=2,
+    )
+    metadata = json.loads((output / "metadata.json").read_text())
+    calls: list[Path] = []
+    original = export_data._sha256
+
+    def counted_sha256(path: Path) -> str:
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(export_data, "_sha256", counted_sha256)
+    dataset = open_training_dataset(output)
+
+    list(dataset.iter_range(IndexRange(0, dataset.count)))
+    list(dataset.iter_batches(IndexRange(0, dataset.count), batch_size=1, seed=17))
+    dataset.cutoffs()
+
+    assert dataset.dataset_digest == metadata["dataset_digest"]
+    assert calls == [output / "shard-00000.npz", output / "shard-00001.npz"]
+
+
+def test_training_dataset_calculates_a_digest_for_legacy_v1_metadata(tmp_path: Path) -> None:
+    output = write_training_dataset([_example("one", 1.0)], tmp_path / "dataset")
+    metadata = json.loads((output / "metadata.json").read_text())
+    metadata.pop("dataset_digest")
+    (output / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+    dataset = open_training_dataset(output)
+
+    assert len(dataset.dataset_digest) == 64
 
 
 def _example(event_id: str, value: float) -> TrainingExample:

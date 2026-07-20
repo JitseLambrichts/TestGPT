@@ -3,16 +3,22 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 from imbalance_pipeline.serving.api import ModelStatus, create_app
-from imbalance_pipeline.storage.clickhouse import Prediction, TransientStorageError
+from imbalance_pipeline.storage.clickhouse import DashboardRow, Prediction, TransientStorageError
 
 NOW = datetime(2026, 7, 13, 10, 1, 5, tzinfo=UTC)
 
 
 class FakePredictionRepository:
-    def __init__(self, result: Prediction | None | Exception) -> None:
+    def __init__(
+        self,
+        result: Prediction | None | Exception,
+        dashboard_result: list[DashboardRow] | Exception | None = None,
+    ) -> None:
         self.result = result
+        self.dashboard_result = dashboard_result if dashboard_result is not None else []
         self.calls = 0
         self.list_calls: list[dict[str, object]] = []
+        self.dashboard_calls: list[dict[str, object]] = []
 
     async def latest_prediction(self) -> Prediction | None:
         self.calls += 1
@@ -44,6 +50,18 @@ class FakePredictionRepository:
             return []
         return [self.result, self.result.model_copy(update={"event_id": "two"})]
 
+    async def list_dashboard_rows(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[DashboardRow]:
+        self.dashboard_calls.append({"start": start, "end": end, "limit": limit})
+        if isinstance(self.dashboard_result, Exception):
+            raise self.dashboard_result
+        return self.dashboard_result
+
 
 def prediction() -> Prediction:
     return Prediction(
@@ -64,6 +82,16 @@ def prediction() -> Prediction:
     )
 
 
+def dashboard_row() -> DashboardRow:
+    return DashboardRow(
+        **prediction().model_dump(),
+        realized_system_imbalance_mw=-12.0,
+        realized_state="negative",
+        flip_actual=True,
+        evaluated_at=NOW,
+    )
+
+
 def test_liveness_does_not_depend_on_clickhouse() -> None:
     repository = FakePredictionRepository(TransientStorageError())
     client = TestClient(create_app(repository))
@@ -80,6 +108,17 @@ def test_readiness_checks_clickhouse_connectivity() -> None:
     client = TestClient(create_app(repository))
 
     response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready"}
+    assert repository.calls == 1
+
+
+def test_documented_readiness_alias_checks_the_same_dependencies() -> None:
+    repository = FakePredictionRepository(prediction())
+    client = TestClient(create_app(repository))
+
+    response = client.get("/health/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
@@ -200,3 +239,66 @@ def test_current_model_omits_any_filesystem_location() -> None:
         "model_version": "model-v1",
     }
     assert "path" not in response.text
+
+
+def test_dashboard_endpoint_returns_live_rows() -> None:
+    repository = FakePredictionRepository(prediction(), [dashboard_row()])
+    client = TestClient(create_app(repository))
+
+    response = client.get(
+        "/v1/dashboard",
+        params={
+            "start": "2026-07-13T04:00:00Z",
+            "end": "2026-07-13T10:02:00Z",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["realized_system_imbalance_mw"] == -12.0
+    assert response.json()["items"][0]["flip_actual"] is True
+    assert repository.dashboard_calls == [
+        {
+            "start": datetime(2026, 7, 13, 4, 0, tzinfo=UTC),
+            "end": datetime(2026, 7, 13, 10, 2, tzinfo=UTC),
+            "limit": 500,
+        }
+    ]
+
+
+def test_dashboard_endpoint_validates_range_and_limit() -> None:
+    client = TestClient(create_app(FakePredictionRepository(None)))
+
+    reversed_range = client.get(
+        "/v1/dashboard?start=2026-07-13T10:02:00Z&end=2026-07-13T04:00:00Z"
+    )
+    naive = client.get(
+        "/v1/dashboard?start=2026-07-13T04:00:00&end=2026-07-13T10:02:00Z"
+    )
+    excessive = client.get(
+        "/v1/dashboard?start=2026-07-13T04:00:00Z&end=2026-07-13T10:02:00Z&limit=10001"
+    )
+
+    assert reversed_range.status_code == 422
+    assert naive.status_code == 422
+    assert excessive.status_code == 422
+
+
+def test_dashboard_endpoint_sanitizes_storage_failure() -> None:
+    client = TestClient(
+        create_app(FakePredictionRepository(None, TransientStorageError("secret")))
+    )
+
+    response = client.get(
+        "/v1/dashboard?start=2026-07-13T04:00:00Z&end=2026-07-13T10:02:00Z"
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "prediction store is temporarily unavailable"
+
+
+def test_dashboard_page_is_served_without_remote_assets() -> None:
+    response = TestClient(create_app(FakePredictionRepository(None))).get("/dashboard")
+
+    assert response.status_code == 200
+    assert 'src="/dashboard-assets/vendor/chart.umd.min.js"' in response.text
+    assert "https://" not in response.text

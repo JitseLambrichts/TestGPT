@@ -67,17 +67,20 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         if len(set(self.seeds)) != 3:
             raise ValueError("training requires exactly three unique ensemble seeds")
-        if min(
-            self.epochs,
-            self.batch_size,
-            self.warmup_epochs,
-            self.early_stopping_patience,
-            self.d_model,
-            self.tcn_blocks,
-            self.transformer_layers,
-            self.transformer_heads,
-            self.mixture_components,
-        ) <= 0:
+        if (
+            min(
+                self.epochs,
+                self.batch_size,
+                self.warmup_epochs,
+                self.early_stopping_patience,
+                self.d_model,
+                self.tcn_blocks,
+                self.transformer_layers,
+                self.transformer_heads,
+                self.mixture_components,
+            )
+            <= 0
+        ):
             raise ValueError("training dimensions and schedule values must be positive")
         if self.d_model % self.transformer_heads != 0:
             raise ValueError("d_model must be divisible by transformer_heads")
@@ -109,6 +112,8 @@ class _EnsemblePredictions:
     flip_mask: NDArray[np.bool_]
     current_state: NDArray[np.int64]
     volatility: NDArray[np.float64]
+    quarter_hour_phase: NDArray[np.int8]
+    source_quality: NDArray[np.int8]
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +322,8 @@ def _ensemble_predictions(
     flip_mask: list[NDArray[np.bool_]] = []
     current_state: list[NDArray[np.int64]] = []
     volatility: list[NDArray[np.float64]] = []
+    quarter_hour_phase: list[NDArray[np.int8]] = []
+    source_quality: list[NDArray[np.int8]] = []
     for result in results:
         result.model.eval()
     with torch.inference_mode():
@@ -375,6 +382,10 @@ def _ensemble_predictions(
             flip_mask.append(batch.flip_mask.cpu().numpy().astype(bool))
             current_state.append(batch.current_state.cpu().numpy().astype(np.int64))
             volatility.append(_volatility(items))
+            quarter_hour_phase.append(
+                np.asarray([item.cutoff.minute % 15 for item in items], dtype=np.int8)
+            )
+            source_quality.append(_source_quality(items))
     return _EnsemblePredictions(
         predicted_mw=np.concatenate(point),
         p10_mw=np.concatenate(p10),
@@ -385,6 +396,8 @@ def _ensemble_predictions(
         flip_mask=np.concatenate(flip_mask),
         current_state=np.concatenate(current_state),
         volatility=np.concatenate(volatility),
+        quarter_hour_phase=np.concatenate(quarter_hour_phase),
+        source_quality=np.concatenate(source_quality),
     )
 
 
@@ -643,10 +656,47 @@ def _cohort_masks(prediction: _EnsemblePredictions) -> dict[str, NDArray[np.bool
     masks: dict[str, NDArray[np.bool_]] = {
         "current_positive": prediction.current_state == 1,
         "current_negative": prediction.current_state == -1,
+        "current_unknown": prediction.current_state == 0,
+        "quarter_hour_phase_start": prediction.quarter_hour_phase < 5,
+        "quarter_hour_phase_middle": (prediction.quarter_hour_phase >= 5)
+        & (prediction.quarter_hour_phase < 10),
+        "quarter_hour_phase_end": prediction.quarter_hour_phase >= 10,
+        "source_quality_validated": prediction.source_quality == 1,
+        "source_quality_unvalidated": prediction.source_quality == 0,
+        "source_quality_unknown": prediction.source_quality == -1,
     }
-    threshold = float(np.quantile(prediction.volatility, 2.0 / 3.0))
-    masks["high_volatility"] = prediction.volatility >= threshold
+    low, medium, high = _volatility_terciles(prediction.volatility)
+    masks["low_volatility"] = low
+    masks["medium_volatility"] = medium
+    masks["high_volatility"] = high
     return masks
+
+
+def _volatility_terciles(
+    volatility: NDArray[np.float64],
+) -> tuple[NDArray[np.bool_], NDArray[np.bool_], NDArray[np.bool_]]:
+    if not len(volatility):
+        raise ValueError("cohorts require at least one prediction")
+    masks = [np.zeros(len(volatility), dtype=bool) for _ in range(3)]
+    # Rank-based tertiles remain disjoint and cover the full sample, even for
+    # a quiet period where multiple histories have identical volatility.
+    for group, indices in enumerate(np.array_split(np.argsort(volatility, kind="stable"), 3)):
+        masks[group][indices] = True
+    return masks[0], masks[1], masks[2]
+
+
+def _source_quality(items: Sequence[TrainingExample]) -> NDArray[np.int8]:
+    """Expose default-schema quality validation without inventing it for custom schemas."""
+    values: list[int] = []
+    for item in items:
+        if item.local_values.shape[-1] <= 5 or item.local_masks.shape[-1] <= 5:
+            values.append(-1)
+            continue
+        if item.local_masks[-1, 5] != 1:
+            values.append(-1)
+            continue
+        values.append(int(item.local_values[-1, 5] > 0.5))
+    return np.asarray(values, dtype=np.int8)
 
 
 def _model_inputs(batch: TrainingBatch) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -728,6 +778,15 @@ def _config_dict(
         "deadband_mw": config.deadband_mw,
         "deterministic": config.deterministic,
         "device": str(device),
+        "dataset": {
+            "count": training.dataset.count,
+            "digest": training.dataset.dataset_digest,
+            "feature_schema_hash": training.dataset.feature_schema_hash,
+            "shards": [
+                {"checksum": shard.checksum, "count": shard.count, "name": shard.name}
+                for shard in training.dataset.shards
+            ],
+        },
         "early_stopping_patience": config.early_stopping_patience,
         "epochs": config.epochs,
         "gradient_clip_norm": config.gradient_clip_norm,

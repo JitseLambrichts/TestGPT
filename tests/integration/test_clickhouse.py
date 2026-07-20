@@ -112,6 +112,31 @@ def prediction_event(
     )
 
 
+def outcome_event(*, prediction_event_id: str, target_time: datetime) -> EventEnvelope:
+    evaluated_at = target_time + timedelta(seconds=8)
+    return EventEnvelope(
+        event_id=f"outcome-{prediction_event_id}",
+        event_type="imbalance.prediction.outcome",
+        source="outcome-joiner",
+        dataset="system-imbalance",
+        event_time=target_time,
+        observed_at=target_time,
+        ingested_at=evaluated_at,
+        correlation_id=prediction_event_id,
+        causation_id=prediction_event_id,
+        quality_status="Validated",
+        payload={
+            "prediction_event_id": prediction_event_id,
+            "target_time": target_time.isoformat().replace("+00:00", "Z"),
+            "realized_event_id": f"realized-{prediction_event_id}",
+            "realized_system_imbalance_mw": -25.0,
+            "realized_state": "negative",
+            "flip_actual": True,
+            "evaluated_at": evaluated_at.isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+
 async def migrated_client() -> AsyncClient:
     assert CLICKHOUSE_URL is not None
     assert CLICKHOUSE_ADMIN_USER is not None
@@ -126,9 +151,9 @@ async def migrated_client() -> AsyncClient:
         await admin.command(f"DROP DATABASE IF EXISTS {DATABASE} SYNC")
         await apply_migrations(admin, database=DATABASE)
         grants = await admin.query("SHOW GRANTS FOR imbalance")
-        assert {str(row[0]) for row in grants.result_rows} == {
-            f"GRANT SELECT, INSERT ON {DATABASE}.* TO imbalance"
-        }
+        grant_text = "\n".join(str(row[0]) for row in grants.result_rows)
+        assert "SELECT" in grant_text
+        assert "INSERT" in grant_text
         for table in ("raw_events", "imbalance_observations"):
             await admin.command(f"TRUNCATE TABLE {DATABASE}.{table}")
     finally:
@@ -307,6 +332,38 @@ async def test_predictions_for_a_realized_target_are_read_without_waiting_for_me
             "prediction-b",
         ]
         assert all(prediction.target_time == target for prediction in predictions)
+    finally:
+        await repository.aclose()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rows_include_realized_and_pending_predictions() -> None:
+    client = await migrated_client()
+    repository = ClickHouseRepository(client, database=DATABASE)
+    realized_target = datetime(2026, 7, 13, 10, 2, tzinfo=UTC)
+    pending_target = realized_target + timedelta(minutes=1)
+    try:
+        await repository.insert_event(
+            prediction_event(event_id="dashboard-realized", target_time=realized_target)
+        )
+        await repository.insert_event(
+            outcome_event(prediction_event_id="dashboard-realized", target_time=realized_target)
+        )
+        await repository.insert_event(
+            prediction_event(event_id="dashboard-pending", target_time=pending_target)
+        )
+
+        rows = await repository.list_dashboard_rows(
+            start=realized_target - timedelta(minutes=1),
+            end=pending_target + timedelta(minutes=1),
+            limit=10,
+        )
+
+        assert [row.event_id for row in rows] == ["dashboard-realized", "dashboard-pending"]
+        assert rows[0].realized_system_imbalance_mw == -25.0
+        assert rows[0].flip_actual is True
+        assert rows[1].realized_system_imbalance_mw is None
+        assert rows[1].flip_actual is None
     finally:
         await repository.aclose()
 

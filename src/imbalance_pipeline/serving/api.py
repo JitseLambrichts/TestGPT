@@ -2,10 +2,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CollectorRegistry, Counter, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 from pydantic import BaseModel
@@ -14,6 +17,7 @@ from imbalance_pipeline.config import Settings, get_settings
 from imbalance_pipeline.model.bundle import ModelManifest
 from imbalance_pipeline.storage.clickhouse import (
     ClickHouseRepository,
+    DashboardRow,
     Prediction,
     TransientStorageError,
 )
@@ -32,6 +36,14 @@ class PredictionRepository(Protocol):
         after_event_id: str | None,
     ) -> list[Prediction]: ...
 
+    async def list_dashboard_rows(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+        limit: int,
+    ) -> list[DashboardRow]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ModelStatus:
@@ -48,6 +60,10 @@ class PredictionCursor(BaseModel):
 class PredictionPage(BaseModel):
     items: list[Prediction]
     next_cursor: PredictionCursor | None
+
+
+class DashboardPage(BaseModel):
+    items: list[DashboardRow]
 
 
 class _ApiMetrics:
@@ -75,6 +91,12 @@ def create_app(
         fallback_enabled=True,
     )
     app = FastAPI(title="Belgian Imbalance Prediction API", version="1")
+    dashboard_dir = Path(__file__).with_name("dashboard")
+    app.mount(
+        "/dashboard-assets",
+        StaticFiles(directory=dashboard_dir),
+        name="dashboard-assets",
+    )
 
     @app.middleware("http")
     async def record_request(
@@ -89,7 +111,8 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/readyz")
+    @app.get("/readyz", include_in_schema=False)
+    @app.get("/health/ready")
     async def readyz() -> dict[str, str]:
         await _probe_repository(repository)
         if active_model.model_version is None and not active_model.fallback_enabled:
@@ -164,6 +187,32 @@ def create_app(
     @app.get("/v1/models/current", response_model=ModelStatus)
     async def current_model() -> ModelStatus:
         return active_model
+
+    @app.get("/v1/dashboard", response_model=DashboardPage)
+    async def dashboard_data(
+        start: datetime,
+        end: datetime,
+        limit: int = Query(default=500, ge=1, le=10_000),
+    ) -> DashboardPage:
+        start = _utc_query_timestamp(start, "start")
+        end = _utc_query_timestamp(end, "end")
+        if end < start:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="end must not precede start",
+            )
+        try:
+            rows = await repository.list_dashboard_rows(start=start, end=end, limit=limit)
+        except TransientStorageError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="prediction store is temporarily unavailable",
+            ) from exc
+        return DashboardPage(items=rows)
+
+    @app.get("/dashboard", response_class=FileResponse, include_in_schema=False)
+    async def dashboard_page() -> FileResponse:
+        return FileResponse(dashboard_dir / "index.html")
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint() -> Response:

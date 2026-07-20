@@ -74,6 +74,14 @@ make export-training START=2026-07-13T00:00:00Z END=2026-07-14T00:00:00Z OUTPUT=
 make train DATASET=exports/imbalance-2026-07-13 OUTPUT=candidates/imbalance-2026-07-13
 ```
 
+Als de volledige ODS133-export al als `data/ods133.csv` aanwezig is, kan deze zonder ClickHouse-omweg worden gebruikt:
+
+```bash
+make train-csv CSV=ods133.csv DATASET=exports/ods133-stride-30 OUTPUT=candidates/ods133-stride-30
+```
+
+De CSV-importer herkent de BOM en puntkommascheiding van het Elia-portaal, sorteert naar UTC, weigert dubbele minuten en gebruikt alleen cutoffs met 24 uur aaneengesloten geschiedenis en een echte volgende minuut. Standaard wordt elke dertigste minuut genomen om de dataset en lokale training beheersbaar te houden; stel `STRIDE=1` in voor alle geschikte minuten. ODS045/ODS046 (pre-MARI) en ODS126 (de instantane operationele SI-reeks) worden bewust niet met ODS133 gemengd.
+
 Valideer de kandidaat en promoot uitsluitend handmatig via `promote_bundle`; export en training wijzigen `models/production` nooit automatisch. Herstart na promotie de runtime:
 
 ```bash
@@ -98,6 +106,7 @@ make up                           # standaardstack bouwen en starten
 make observability                # stack + Prometheus/Grafana
 make backfill START=… END=…       # één UTC-dag opnieuw ophalen
 make train DATASET=… OUTPUT=…     # trainerprofiel in Docker
+make train-csv CSV=… DATASET=… OUTPUT=… # ODS133 CSV exporteren en trainen
 make smoke                        # opt-in live Elia smoke test
 make down
 ```

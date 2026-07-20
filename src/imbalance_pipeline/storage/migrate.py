@@ -148,18 +148,25 @@ async def _table_exists(client: AsyncClient, table: str) -> bool:
 
 
 async def _applied_checksums(client: AsyncClient, database: str) -> dict[int, str]:
-    result = await client.query(
-        f"SELECT version, checksum FROM {database}.schema_migrations FINAL"
-    )
+    result = await client.query(f"SELECT version, checksum FROM {database}.schema_migrations FINAL")
     return {
-        cast(int, version): _checksum_text(checksum)
-        for version, checksum in result.result_rows
+        cast(int, version): _checksum_text(checksum) for version, checksum in result.result_rows
     }
 
 
 async def _execute_sql(client: AsyncClient, contents: str) -> None:
     for statement in _sql_statements(contents):
-        await client.command(statement)
+        try:
+            await client.command(statement)
+        except ClickHouseError as exc:
+            # The official Docker image creates CLICKHOUSE_USER in users.xml.
+            # That storage is deliberately immutable to SQL GRANT, while the
+            # entrypoint already gives that user the needed application rights.
+            if statement.lstrip().upper().startswith("GRANT ") and "ACCESS_STORAGE_READONLY" in str(
+                exc
+            ):
+                continue
+            raise
 
 
 def _sql_statements(contents: str) -> Iterable[str]:
@@ -172,13 +179,10 @@ def _sql_statements(contents: str) -> Iterable[str]:
 
 
 def _render_sql(template: str, database: str) -> str:
-    return (
-        template.replace(
-            "CREATE DATABASE IF NOT EXISTS imbalance",
-            f"CREATE DATABASE IF NOT EXISTS {database}",
-        )
-        .replace("imbalance.", f"{database}.")
-    )
+    return template.replace(
+        "CREATE DATABASE IF NOT EXISTS imbalance",
+        f"CREATE DATABASE IF NOT EXISTS {database}",
+    ).replace("imbalance.", f"{database}.")
 
 
 def _checksum_text(value: object) -> str:

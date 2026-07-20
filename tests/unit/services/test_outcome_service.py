@@ -278,6 +278,36 @@ async def test_outcome_service_excludes_predictions_generated_after_the_target()
 
 
 @pytest.mark.asyncio
+async def test_outcome_service_includes_prediction_made_before_realization_arrived() -> None:
+    trace: list[tuple[str, object]] = []
+    realization_arrived_at = NOW + timedelta(minutes=1)
+    repository = FakeOutcomeRepository(
+        [prediction("live-prediction", "positive", generated_at=NOW + timedelta(seconds=30))]
+    )
+    bus = RecordingBus(trace)
+    event = stored_event().model_copy(
+        update={
+            "ingested_at": realization_arrived_at,
+            "observed_at": realization_arrived_at,
+            "payload": {
+                "source_event_id": "source-event-001",
+                "timestamp": NOW.isoformat().replace("+00:00", "Z"),
+                "source_ingested_at": realization_arrived_at.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            },
+        }
+    )
+
+    await OutcomeService(repository, bus).handle(RecordingMessage(event, trace))
+
+    assert trace[-1] == ("ack", "stored-event-001")
+    assert [published.payload["prediction_event_id"] for _, published in bus.published] == [
+        "live-prediction"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_outcome_service_naks_retryable_repository_errors() -> None:
     trace: list[tuple[str, object]] = []
     repository = FakeOutcomeRepository(

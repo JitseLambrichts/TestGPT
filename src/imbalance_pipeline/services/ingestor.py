@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import hashlib
 import importlib
@@ -419,13 +420,26 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-async def _run_service() -> None:
+async def _run_service(
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> None:
     settings = get_settings()
     nats_module = importlib.import_module("imbalance_pipeline.messaging.nats")
 
     async def serve(bus: _ManagedEventBus) -> None:
         async with EliaClient(base_url=settings.elia_base_url) as client:
-            await Ingestor(client=client, bus=bus, settings=settings).run_forever()
+            ingestor = Ingestor(client=client, bus=bus, settings=settings)
+            if start is None and end is None:
+                await ingestor.run_forever()
+                return
+            if start is None or end is None:
+                raise ValueError("backfill requires both start and end")
+            await ingestor.poll_imbalance_once(start=start, end=end)
+            await ingestor.poll_load_once(start=start, end=end)
+            await ingestor.poll_wind_once(start=start, end=end)
+            await ingestor.poll_solar_once(start=start, end=end)
 
     await _run_with_event_bus(
         settings=settings,
@@ -448,5 +462,18 @@ async def _run_with_event_bus(
         await bus.aclose()
 
 
+def _parse_utc_argument(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError("backfill timestamps must be UTC-aware")
+    return parsed.astimezone(UTC)
+
+
 def main() -> None:
-    asyncio.run(_run_service())
+    parser = argparse.ArgumentParser(description="Poll Elia continuously or backfill one UTC day.")
+    parser.add_argument("--start", type=_parse_utc_argument)
+    parser.add_argument("--end", type=_parse_utc_argument)
+    arguments = parser.parse_args()
+    if (arguments.start is None) != (arguments.end is None):
+        parser.error("--start and --end must be supplied together")
+    asyncio.run(_run_service(start=arguments.start, end=arguments.end))

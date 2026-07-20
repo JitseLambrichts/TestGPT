@@ -1,9 +1,11 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import numpy as np
 
 from imbalance_pipeline.domain.imbalance import ConfirmedState
 from imbalance_pipeline.training.baselines import (
+    _compact_example,
     classical_baseline,
     clipped_linear_drift_baseline,
     persistence_baseline,
@@ -72,6 +74,25 @@ def test_classical_baseline_accepts_streams_and_bounds_its_training_reservoir() 
 
     assert result.predicted_mw.shape == (4,)
     assert result.flip_probability.shape == (4,)
+
+
+def test_classical_baseline_preserves_each_feature_channel_in_its_compact_representation() -> None:
+    template = _example(history=[0.0, 1.0], target=2.0)
+    first = replace(
+        template,
+        local_values=np.asarray([[0.0, 10.0], [20.0, 30.0]], dtype=np.float32),
+    )
+    second = replace(
+        template,
+        local_values=np.asarray([[0.0, 20.0], [10.0, 30.0]], dtype=np.float32),
+    )
+
+    first_compact = _compact_example(first)
+    second_compact = _compact_example(second)
+
+    assert first_compact.shape == (20,)
+    assert second_compact.shape == (20,)
+    assert not np.array_equal(first_compact, second_compact)
 
 
 def _example(*, history: list[float], target: float) -> TrainingExample:

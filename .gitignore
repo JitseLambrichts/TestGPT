@@ -29,3 +29,6 @@ data/nats/
 data/exports/
 runs/
 models/production/
+models/candidates/
+
+data/

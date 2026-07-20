@@ -17,6 +17,7 @@ from imbalance_pipeline.services.ingestor import (
     MAX_PAGE_RANGE,
     Ingestor,
     PollIntervals,
+    _parse_utc_argument,
 )
 from imbalance_pipeline.sources.weather import (
     WEATHER_LOCATIONS,
@@ -153,6 +154,12 @@ def test_transport_contracts_are_runtime_checkable() -> None:
 
     assert isinstance(bus, EventBus)
     assert isinstance(message, Message)
+
+
+def test_backfill_cli_timestamps_require_utc() -> None:
+    assert _parse_utc_argument("2026-07-13T10:00:00Z") == datetime(2026, 7, 13, 10, tzinfo=UTC)
+    with pytest.raises(ValueError, match="UTC-aware"):
+        _parse_utc_argument("2026-07-13T10:00:00")
 
 
 @pytest.mark.asyncio
